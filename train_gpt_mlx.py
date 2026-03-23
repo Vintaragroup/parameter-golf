@@ -415,16 +415,23 @@ class GPT(nn.Module):
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
 
-    def __call__(self, input_ids: mx.array, memory: mx.array | None = None, injection_mode: str = "pre_x0") -> mx.array:
+    def __call__(self, input_ids: mx.array, memory: mx.array | None = None, injection_mode: str = "pre_x0", inject_scale: float = 1.0) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         # Inject cross-chunk document memory when provided (eval-only; None is a no-op).
         # pre_x0: inject before x0=x so memory flows through both residual and skip paths (default)
         # post_x0: inject after x0=x so only main residual stream carries memory; x0 stays clean
+        # inject_scale: memory is scaled so its per-row norm = inject_scale * per-row embedding norm
+        def _scaled_memory(x_ref: mx.array) -> mx.array:
+            emb_norms = mx.sqrt((x_ref ** 2).sum(axis=-1, keepdims=True))    # (B, T, 1)
+            mem_norms  = mx.sqrt((memory ** 2).sum(axis=-1, keepdims=True))  # (B, 1)
+            # scale memory so its norm = inject_scale * mean embedding norm, then broadcast over T
+            scale = inject_scale * emb_norms.mean(axis=1) / (mem_norms + 1e-8)  # (B, 1)
+            return (memory * scale).astype(x_ref.dtype)[:, None, :]              # (B, 1, D)
         if memory is not None and injection_mode == "pre_x0":
-            x = x + memory[:, None, :].astype(x.dtype)
+            x = x + _scaled_memory(x)
         x0 = x
         if memory is not None and injection_mode == "post_x0":
-            x = x + memory[:, None, :].astype(x.dtype)
+            x = x + _scaled_memory(x)
         skips: list[mx.array] = []
 
         for i in range(self.num_encoder_layers):
@@ -778,6 +785,7 @@ def eval_val(
     mem_alpha: float = 0.9,                 # LOCAL ONLY — EMA coefficient for stream memory
     max_mem_norm: float = 10.0,             # LOCAL ONLY — per-row norm clamp for stream memory
     mem_injection: str = "pre_x0",          # LOCAL ONLY — injection point: "pre_x0" or "post_x0"
+    inject_scale: float = 1.0,              # LOCAL ONLY — scale memory to this fraction of embedding norm
     model=None,                             # required when use_stream_memory=True
 ) -> tuple[float, float]:
     # Validation computes two metrics:
@@ -816,7 +824,7 @@ def eval_val(
         chunk_token_count = float(y.size)
         if use_stream_memory:
             # Call model directly to obtain hidden states for the memory update.
-            hidden = model(x, memory=doc_memory, injection_mode=mem_injection)  # (B, T, D)
+            hidden = model(x, memory=doc_memory, injection_mode=mem_injection, inject_scale=inject_scale)  # (B, T, D)
             flat = hidden.reshape(-1, model.tok_emb.weight.shape[1])
             logits = model.softcap(flat @ model.tok_emb.weight.astype(flat.dtype).T)
             batch_loss = nn.losses.cross_entropy(logits.astype(mx.float32), y.reshape(-1), reduction="mean")
@@ -836,7 +844,11 @@ def eval_val(
                 row_norms = mx.sqrt((doc_memory ** 2).sum(axis=1))  # (B,)
                 max_norm = float(row_norms.max().item())
                 mean_norm = float(row_norms.mean().item())
-                print(f"[Memory] batch={batch_idx - 1} max_row_norm={max_norm:.4f} mean_row_norm={mean_norm:.4f}")
+                # Also report the effective injection ratio vs a rough embedding norm estimate
+                _emb_raw = model.tok_emb.weight  # (vocab, D) — use RMS as proxy for emb norm
+                _emb_proxy = float(mx.sqrt((_emb_raw.astype(mx.float32) ** 2).mean()).item())
+                _eff_ratio = inject_scale * _emb_proxy / (mean_norm + 1e-8)
+                print(f"[Memory] batch={batch_idx - 1} max_row_norm={max_norm:.4f} mean_row_norm={mean_norm:.4f} eff_inject_ratio={_eff_ratio:.4f}")
         else:
             batch_loss = compiled_loss(x, y).astype(mx.float32)
             mx.eval(batch_loss)
@@ -868,11 +880,12 @@ LOCAL_USE_STREAM_MEMORY: bool = False        # True to test stream memory path
 LOCAL_MEMORY_ALPHA: float = 0.9             # EMA coefficient for stream memory (ablation: 0.7 / 0.9 / 0.95)
 LOCAL_TEST: bool = True                      # True to run A/B experiment instead of training
 # --- mini training run (only used when LOCAL_TRAIN=True) ---
-LOCAL_TRAIN: bool = False                    # True to train briefly then run stream memory eval
-LOCAL_TRAIN_ITERATIONS: int = 200            # steps; 200 * 65536 tok ≈ 13M tokens, ~5-10 min on M-series
+LOCAL_TRAIN: bool = True                     # True to train briefly then run stream memory eval
+LOCAL_TRAIN_ITERATIONS: int = 50             # steps; 50 * 65536 tok ≈ 3M tokens, fast probe run
 LOCAL_TRAIN_BATCH_TOKENS: int = 65536        # one microbatch (64 seqs x 1024); keeps Metal memory low
 LOCAL_GRAD_ACCUM_STEPS: int = 1             # no accumulation for simplicity
 LOCAL_WARMUP_STEPS: int = 5                 # prime Metal shaders without updating weights
+LOCAL_MEMORY_INJECT_SCALE: float = 0.1      # fraction of embedding norm to inject as memory signal
 
 # TRAINING
 # -----------------------------
@@ -1252,6 +1265,8 @@ def run_local_train_then_eval() -> None:
     _clamp = 15.0
     _mode  = "pre_x0"
 
+    _inject_scales = [0.02, 0.05, 0.10, 0.20]   # ablation grid — trained-model injection scale
+
     print(f"\n===== POST-TRAINING STREAM MEMORY EVAL (cap={_cap}, alpha={_alpha}, clamp={_clamp}) =====")
 
     print("\n===== BASELINE RUN =====")
@@ -1264,26 +1279,27 @@ def run_local_train_then_eval() -> None:
     )
     print(f"  val_loss={base_loss:.4f}  val_bpb={base_bpb:.4f}  time={1000*(time.perf_counter()-t0):.0f}ms")
 
-    print("\n===== MEMORY RUN =====")
-    t1 = time.perf_counter()
-    mem_loss, mem_bpb = eval_val(
-        args, compiled_loss, val_tokens,
-        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        max_eval_batches=_cap,
-        use_stream_memory=True,
-        mem_alpha=_alpha,
-        max_mem_norm=_clamp,
-        mem_injection=_mode,
-        model=model,
-    )
-    print(f"  val_loss={mem_loss:.4f}  val_bpb={mem_bpb:.4f}  time={1000*(time.perf_counter()-t1):.0f}ms")
+    print(f"\n===== INJECT SCALE ABLATION (scales={_inject_scales}) =====")
+    for _scale in _inject_scales:
+        print(f"\n----- inject_scale={_scale} -----")
+        t1 = time.perf_counter()
+        mem_loss, mem_bpb = eval_val(
+            args, compiled_loss, val_tokens,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            max_eval_batches=_cap,
+            use_stream_memory=True,
+            mem_alpha=_alpha,
+            max_mem_norm=_clamp,
+            mem_injection=_mode,
+            inject_scale=_scale,
+            model=model,
+        )
+        print(f"  val_loss={mem_loss:.4f}  val_bpb={mem_bpb:.4f}  time={1000*(time.perf_counter()-t1):.0f}ms")
+        print(f"  baseline_bpb={base_bpb:.4f}  memory_bpb={mem_bpb:.4f}  delta_bpb={mem_bpb - base_bpb:+.4f}  (negative = memory helps)")
 
-    print("----- RESULT -----")
+    print("\n===== ABLATION SUMMARY =====")
     print(f"  training_steps={LOCAL_TRAIN_ITERATIONS}  batch_tokens={LOCAL_TRAIN_BATCH_TOKENS}")
-    print(f"  alpha={_alpha}  clamp={_clamp}  injection={_mode}")
-    print(f"  baseline_bpb={base_bpb:.4f}")
-    print(f"  memory_bpb={mem_bpb:.4f}")
-    print(f"  delta_bpb={mem_bpb - base_bpb:+.4f}  (negative = memory helps)")
+    print(f"  alpha={_alpha}  clamp={_clamp}  injection={_mode}  baseline_bpb={base_bpb:.4f}")
 
 
 def run_local_experiment() -> None:

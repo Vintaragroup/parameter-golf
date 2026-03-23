@@ -772,6 +772,7 @@ def eval_val(
     max_eval_batches: int | None = None,   # LOCAL ONLY — None for official eval
     use_stream_memory: bool = False,        # LOCAL ONLY — False for official eval
     mem_alpha: float = 0.9,                 # LOCAL ONLY — EMA coefficient for stream memory
+    max_mem_norm: float = 10.0,             # LOCAL ONLY — per-row norm clamp for stream memory
     model=None,                             # required when use_stream_memory=True
 ) -> tuple[float, float]:
     # Validation computes two metrics:
@@ -822,10 +823,9 @@ def eval_val(
             if doc_memory is None or doc_memory.shape != (B, D):
                 doc_memory = mx.zeros((B, D))
             doc_memory = (_mem_alpha * doc_memory + (1.0 - _mem_alpha) * new_signal)
-            # Norm clamp: scale each batch element to max_memory_norm if exceeded
-            _max_norm = 10.0
+            # Norm clamp: scale each batch element to max_mem_norm if exceeded
             _norms = mx.sqrt((doc_memory ** 2).sum(axis=1, keepdims=True))  # (B, 1)
-            doc_memory = mx.where(_norms > _max_norm, doc_memory * (_max_norm / (_norms + 1e-8)), doc_memory)
+            doc_memory = mx.where(_norms > max_mem_norm, doc_memory * (max_mem_norm / (_norms + 1e-8)), doc_memory)
             mx.eval(doc_memory)
             if (batch_idx - 1) % 50 == 0:
                 row_norms = mx.sqrt((doc_memory ** 2).sum(axis=1))  # (B,)
@@ -1158,12 +1158,13 @@ def main() -> None:
 
 
 def run_local_experiment() -> None:
-    """A/B test: baseline eval vs stream-memory eval using the same batch cap.
+    """Max-norm clamp ablation: alpha fixed at 0.70, varies clamp in one pass.
     Run with: LOCAL_TEST=True python train_gpt_mlx.py
-    Flip LOCAL_MAX_EVAL_BATCHES to control speed (10 = ~2-3 min on Apple Silicon).
     """
     import sentencepiece as spm
-    _cap = 100  # override here for the experiment; ignores LOCAL_MAX_EVAL_BATCHES
+    _cap = 100           # batches per run
+    _alpha = 0.70        # fixed
+    _clamp = 15.0        # fixed
 
     args = Hyperparameters()
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
@@ -1180,6 +1181,7 @@ def run_local_experiment() -> None:
     )
     compiled_loss = mx.compile(lambda x, y: model.loss(x, y), inputs=model.state, outputs=model.state)
 
+    # Shared baseline — run once; memory path does not affect baseline
     print("\n===== BASELINE RUN =====")
     t0 = time.perf_counter()
     base_loss, base_bpb = eval_val(
@@ -1190,23 +1192,24 @@ def run_local_experiment() -> None:
     )
     print(f"  val_loss={base_loss:.4f}  val_bpb={base_bpb:.4f}  time={1000*(time.perf_counter()-t0):.0f}ms")
 
-    print("\n===== STREAM MEMORY RUN =====")
-    print(f"  alpha={LOCAL_MEMORY_ALPHA}")
+    print(f"\n===== MEMORY RUN (alpha={_alpha}, clamp={_clamp}) =====")
     t1 = time.perf_counter()
     mem_loss, mem_bpb = eval_val(
         args, compiled_loss, val_tokens,
         base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
         max_eval_batches=_cap,
         use_stream_memory=True,
-        mem_alpha=LOCAL_MEMORY_ALPHA,
+        mem_alpha=_alpha,
+        max_mem_norm=_clamp,
         model=model,
     )
     print(f"  val_loss={mem_loss:.4f}  val_bpb={mem_bpb:.4f}  time={1000*(time.perf_counter()-t1):.0f}ms")
 
-    print("\n===== COMPARISON =====")
-    print(f"  loss delta (memory - baseline): {mem_loss - base_loss:+.4f}")
-    print(f"  bpb  delta (memory - baseline): {mem_bpb  - base_bpb:+.4f}")
-    print(f"  (negative = memory helps)")
+    print("----- RESULT -----")
+    print(f"  clamp={_clamp}  alpha={_alpha}")
+    print(f"  baseline_bpb={base_bpb:.4f}")
+    print(f"  memory_bpb={mem_bpb:.4f}")
+    print(f"  delta_bpb={mem_bpb - base_bpb:+.4f}  (negative = memory helps)")
 
 
 if __name__ == "__main__":

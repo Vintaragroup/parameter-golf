@@ -247,8 +247,13 @@ def eval_val(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
+    # Document memory: EMA of mean final hidden state, carried across sequential chunks.
+    # Reset (to None) when batch shape changes (i.e., at end-of-stream boundary).
+    # alpha=0.9 weights recent context lightly; memory=None on first chunk is a no-op.
+    doc_memory: Tensor | None = None
+    _mem_alpha = 0.9
     with torch.inference_mode():
-        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+        for eval_step, batch_seq_start in enumerate(range(seq_start, seq_end, local_batch_seqs)):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
             raw_start = batch_seq_start * args.train_seq_len
             raw_end = batch_seq_end * args.train_seq_len + 1
@@ -256,7 +261,15 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                batch_loss, final_hidden = model(x, y, memory=doc_memory, return_final_hidden=True)
+                batch_loss = batch_loss.detach()
+            # Update memory: EMA of per-sequence mean over the token dimension.
+            new_signal = final_hidden.mean(dim=1)  # (B, D)
+            if doc_memory is None or doc_memory.shape != new_signal.shape:
+                doc_memory = torch.zeros_like(new_signal)
+            doc_memory = (_mem_alpha * doc_memory + (1.0 - _mem_alpha) * new_signal).detach()
+            if eval_step % 50 == 0:
+                print(f"[Memory] eval_step={eval_step} norm={doc_memory.norm().item():.4f}")
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -697,9 +710,19 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor,
+        *,
+        memory: Tensor | None = None,
+        return_final_hidden: bool = False,
+    ):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        # Inject cross-chunk document memory (eval only; no-op when memory is None).
+        if memory is not None:
+            x = x + memory.unsqueeze(1).to(dtype=x.dtype)
         x0 = x
         skips: list[Tensor] = []
 
@@ -712,7 +735,8 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        final_h = self.final_norm(x)  # (B, T, D) — kept for memory update before reshape
+        x = final_h.reshape(-1, final_h.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -721,7 +745,10 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        if return_final_hidden:
+            return loss, final_h
+        return loss
 
 
 # -----------------------------

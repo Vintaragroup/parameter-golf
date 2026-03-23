@@ -415,8 +415,11 @@ class GPT(nn.Module):
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
 
-    def __call__(self, input_ids: mx.array) -> mx.array:
+    def __call__(self, input_ids: mx.array, memory: mx.array | None = None) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        # Inject cross-chunk document memory when provided (eval-only; None is a no-op).
+        if memory is not None:
+            x = x + memory[:, None, :].astype(x.dtype)
         x0 = x
         skips: list[mx.array] = []
 

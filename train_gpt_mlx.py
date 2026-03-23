@@ -769,6 +769,9 @@ def eval_val(
     has_leading_space_lut: np.ndarray,
     is_boundary_token_lut: np.ndarray,
     log_fn: Callable[[str], None] | None = None,
+    max_eval_batches: int | None = None,   # LOCAL ONLY — None for official eval
+    use_stream_memory: bool = False,        # LOCAL ONLY — False for official eval
+    model=None,                             # required when use_stream_memory=True
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
@@ -780,13 +783,21 @@ def eval_val(
             f"got VAL_BATCH_SIZE={args.val_batch_size}, GRAD_ACCUM_STEPS={args.grad_accum_steps}, "
             f"TRAIN_SEQ_LEN={args.train_seq_len}"
         )
+    if use_stream_memory:
+        print("[Stream Memory] enabled (local experiment)")
+    if max_eval_batches is not None:
+        print(f"[Eval Cap] Using {max_eval_batches} batches (local only)")
     val_batch_seqs = val_batch_tokens // args.train_seq_len
     total_seqs = (val_tokens.size - 1) // args.train_seq_len
     total_batches = max((total_seqs + val_batch_seqs - 1) // val_batch_seqs, 1)
     total_loss_sum = 0.0
     total_tokens = 0.0
     total_bytes = 0.0
+    doc_memory: mx.array | None = None
+    _mem_alpha = 0.9
     for batch_idx, batch_seq_start in enumerate(range(0, total_seqs, val_batch_seqs), start=1):
+        if max_eval_batches is not None and batch_idx - 1 >= max_eval_batches:
+            break
         batch_seq_end = min(batch_seq_start + val_batch_seqs, total_seqs)
         raw_start = batch_seq_start * args.train_seq_len
         raw_end = batch_seq_end * args.train_seq_len + 1
@@ -796,8 +807,27 @@ def eval_val(
         x = mx.array(x_np, dtype=mx.int32)
         y = mx.array(y_np, dtype=mx.int32)
         chunk_token_count = float(y.size)
-        batch_loss = compiled_loss(x, y).astype(mx.float32)
-        mx.eval(batch_loss)
+        if use_stream_memory:
+            # Call model directly to obtain hidden states for the memory update.
+            hidden = model(x, memory=doc_memory)  # (B, T, D)
+            flat = hidden.reshape(-1, model.tok_emb.weight.shape[1])
+            logits = model.softcap(flat @ model.tok_emb.weight.astype(flat.dtype).T)
+            batch_loss = nn.losses.cross_entropy(logits.astype(mx.float32), y.reshape(-1), reduction="mean")
+            mx.eval(batch_loss)
+            # EMA memory update: mean over token dim -> (B, D)
+            new_signal = hidden.mean(axis=1).astype(mx.float32)
+            mx.eval(new_signal)
+            B, D = new_signal.shape
+            if doc_memory is None or doc_memory.shape != (B, D):
+                doc_memory = mx.zeros((B, D))
+            doc_memory = (_mem_alpha * doc_memory + (1.0 - _mem_alpha) * new_signal)
+            mx.eval(doc_memory)
+            if (batch_idx - 1) % 50 == 0:
+                norm = float(mx.sqrt((doc_memory ** 2).sum()).item())
+                print(f"[Memory] batch={batch_idx - 1} norm={norm:.4f}")
+        else:
+            batch_loss = compiled_loss(x, y).astype(mx.float32)
+            mx.eval(batch_loss)
         total_loss_sum += float(batch_loss.item()) * chunk_token_count
         prev_ids = x_np.reshape(-1)
         tgt_ids = y_np.reshape(-1)
@@ -817,6 +847,13 @@ def eval_val(
     return val_loss, val_bpb
 
 # -----------------------------
+# =============================================================================
+# LOCAL EXPERIMENT TOGGLES — flip these for fast local runs, do NOT submit
+# with non-default values. Must be None/False for official evaluation.
+# =============================================================================
+LOCAL_MAX_EVAL_BATCHES: int | None = None   # e.g. 50 to cap val batches locally
+LOCAL_USE_STREAM_MEMORY: bool = False        # True to test stream memory path
+
 # TRAINING
 # -----------------------------
 
@@ -1016,6 +1053,9 @@ def main() -> None:
                 has_leading_space_lut,
                 is_boundary_token_lut,
                 log_fn=log,
+                max_eval_batches=LOCAL_MAX_EVAL_BATCHES,
+                use_stream_memory=LOCAL_USE_STREAM_MEMORY,
+                model=model if LOCAL_USE_STREAM_MEMORY else None,
             )
             if step % 25 == 0 or last_step:
                 log(
@@ -1097,6 +1137,9 @@ def main() -> None:
         has_leading_space_lut,
         is_boundary_token_lut,
         log_fn=log,
+        max_eval_batches=LOCAL_MAX_EVAL_BATCHES,
+        use_stream_memory=LOCAL_USE_STREAM_MEMORY,
+        model=model if LOCAL_USE_STREAM_MEMORY else None,
     )
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
     log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")

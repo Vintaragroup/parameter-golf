@@ -771,6 +771,7 @@ def eval_val(
     log_fn: Callable[[str], None] | None = None,
     max_eval_batches: int | None = None,   # LOCAL ONLY — None for official eval
     use_stream_memory: bool = False,        # LOCAL ONLY — False for official eval
+    mem_alpha: float = 0.9,                 # LOCAL ONLY — EMA coefficient for stream memory
     model=None,                             # required when use_stream_memory=True
 ) -> tuple[float, float]:
     # Validation computes two metrics:
@@ -794,7 +795,7 @@ def eval_val(
     total_tokens = 0.0
     total_bytes = 0.0
     doc_memory: mx.array | None = None
-    _mem_alpha = 0.9
+    _mem_alpha = mem_alpha
     for batch_idx, batch_seq_start in enumerate(range(0, total_seqs, val_batch_seqs), start=1):
         if max_eval_batches is not None and batch_idx - 1 >= max_eval_batches:
             break
@@ -821,10 +822,16 @@ def eval_val(
             if doc_memory is None or doc_memory.shape != (B, D):
                 doc_memory = mx.zeros((B, D))
             doc_memory = (_mem_alpha * doc_memory + (1.0 - _mem_alpha) * new_signal)
+            # Norm clamp: scale each batch element to max_memory_norm if exceeded
+            _max_norm = 10.0
+            _norms = mx.sqrt((doc_memory ** 2).sum(axis=1, keepdims=True))  # (B, 1)
+            doc_memory = mx.where(_norms > _max_norm, doc_memory * (_max_norm / (_norms + 1e-8)), doc_memory)
             mx.eval(doc_memory)
             if (batch_idx - 1) % 50 == 0:
-                norm = float(mx.sqrt((doc_memory ** 2).sum()).item())
-                print(f"[Memory] batch={batch_idx - 1} norm={norm:.4f}")
+                row_norms = mx.sqrt((doc_memory ** 2).sum(axis=1))  # (B,)
+                max_norm = float(row_norms.max().item())
+                mean_norm = float(row_norms.mean().item())
+                print(f"[Memory] batch={batch_idx - 1} max_row_norm={max_norm:.4f} mean_row_norm={mean_norm:.4f}")
         else:
             batch_loss = compiled_loss(x, y).astype(mx.float32)
             mx.eval(batch_loss)
@@ -853,6 +860,8 @@ def eval_val(
 # =============================================================================
 LOCAL_MAX_EVAL_BATCHES: int | None = None   # e.g. 50 to cap val batches locally
 LOCAL_USE_STREAM_MEMORY: bool = False        # True to test stream memory path
+LOCAL_MEMORY_ALPHA: float = 0.9             # EMA coefficient for stream memory (ablation: 0.7 / 0.9 / 0.95)
+LOCAL_TEST: bool = True                      # True to run A/B experiment instead of training
 
 # TRAINING
 # -----------------------------
@@ -1055,6 +1064,7 @@ def main() -> None:
                 log_fn=log,
                 max_eval_batches=LOCAL_MAX_EVAL_BATCHES,
                 use_stream_memory=LOCAL_USE_STREAM_MEMORY,
+                mem_alpha=LOCAL_MEMORY_ALPHA,
                 model=model if LOCAL_USE_STREAM_MEMORY else None,
             )
             if step % 25 == 0 or last_step:
@@ -1139,6 +1149,7 @@ def main() -> None:
         log_fn=log,
         max_eval_batches=LOCAL_MAX_EVAL_BATCHES,
         use_stream_memory=LOCAL_USE_STREAM_MEMORY,
+        mem_alpha=LOCAL_MEMORY_ALPHA,
         model=model if LOCAL_USE_STREAM_MEMORY else None,
     )
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
@@ -1146,5 +1157,60 @@ def main() -> None:
     log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
 
+def run_local_experiment() -> None:
+    """A/B test: baseline eval vs stream-memory eval using the same batch cap.
+    Run with: LOCAL_TEST=True python train_gpt_mlx.py
+    Flip LOCAL_MAX_EVAL_BATCHES to control speed (10 = ~2-3 min on Apple Silicon).
+    """
+    import sentencepiece as spm
+    _cap = 100  # override here for the experiment; ignores LOCAL_MAX_EVAL_BATCHES
+
+    args = Hyperparameters()
+    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+        sp, args.vocab_size
+    )
+    model = GPT(
+        vocab_size=args.vocab_size, num_layers=args.num_layers, dim=args.model_dim,
+        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+        logit_chunk_tokens=args.logit_chunk_tokens, logit_softcap=args.logit_softcap,
+        rope_base=args.rope_base, tied_embed_init_std=args.tied_embed_init_std,
+        qk_gain_init=args.qk_gain_init,
+    )
+    compiled_loss = mx.compile(lambda x, y: model.loss(x, y), inputs=model.state, outputs=model.state)
+
+    print("\n===== BASELINE RUN =====")
+    t0 = time.perf_counter()
+    base_loss, base_bpb = eval_val(
+        args, compiled_loss, val_tokens,
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        max_eval_batches=_cap,
+        use_stream_memory=False,
+    )
+    print(f"  val_loss={base_loss:.4f}  val_bpb={base_bpb:.4f}  time={1000*(time.perf_counter()-t0):.0f}ms")
+
+    print("\n===== STREAM MEMORY RUN =====")
+    print(f"  alpha={LOCAL_MEMORY_ALPHA}")
+    t1 = time.perf_counter()
+    mem_loss, mem_bpb = eval_val(
+        args, compiled_loss, val_tokens,
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        max_eval_batches=_cap,
+        use_stream_memory=True,
+        mem_alpha=LOCAL_MEMORY_ALPHA,
+        model=model,
+    )
+    print(f"  val_loss={mem_loss:.4f}  val_bpb={mem_bpb:.4f}  time={1000*(time.perf_counter()-t1):.0f}ms")
+
+    print("\n===== COMPARISON =====")
+    print(f"  loss delta (memory - baseline): {mem_loss - base_loss:+.4f}")
+    print(f"  bpb  delta (memory - baseline): {mem_bpb  - base_bpb:+.4f}")
+    print(f"  (negative = memory helps)")
+
+
 if __name__ == "__main__":
-    main()
+    if LOCAL_TEST:
+        run_local_experiment()
+    else:
+        main()

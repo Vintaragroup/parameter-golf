@@ -415,12 +415,16 @@ class GPT(nn.Module):
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
 
-    def __call__(self, input_ids: mx.array, memory: mx.array | None = None) -> mx.array:
+    def __call__(self, input_ids: mx.array, memory: mx.array | None = None, injection_mode: str = "pre_x0") -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         # Inject cross-chunk document memory when provided (eval-only; None is a no-op).
-        if memory is not None:
+        # pre_x0: inject before x0=x so memory flows through both residual and skip paths (default)
+        # post_x0: inject after x0=x so only main residual stream carries memory; x0 stays clean
+        if memory is not None and injection_mode == "pre_x0":
             x = x + memory[:, None, :].astype(x.dtype)
         x0 = x
+        if memory is not None and injection_mode == "post_x0":
+            x = x + memory[:, None, :].astype(x.dtype)
         skips: list[mx.array] = []
 
         for i in range(self.num_encoder_layers):
@@ -773,6 +777,7 @@ def eval_val(
     use_stream_memory: bool = False,        # LOCAL ONLY — False for official eval
     mem_alpha: float = 0.9,                 # LOCAL ONLY — EMA coefficient for stream memory
     max_mem_norm: float = 10.0,             # LOCAL ONLY — per-row norm clamp for stream memory
+    mem_injection: str = "pre_x0",          # LOCAL ONLY — injection point: "pre_x0" or "post_x0"
     model=None,                             # required when use_stream_memory=True
 ) -> tuple[float, float]:
     # Validation computes two metrics:
@@ -811,7 +816,7 @@ def eval_val(
         chunk_token_count = float(y.size)
         if use_stream_memory:
             # Call model directly to obtain hidden states for the memory update.
-            hidden = model(x, memory=doc_memory)  # (B, T, D)
+            hidden = model(x, memory=doc_memory, injection_mode=mem_injection)  # (B, T, D)
             flat = hidden.reshape(-1, model.tok_emb.weight.shape[1])
             logits = model.softcap(flat @ model.tok_emb.weight.astype(flat.dtype).T)
             batch_loss = nn.losses.cross_entropy(logits.astype(mx.float32), y.reshape(-1), reduction="mean")
@@ -862,6 +867,12 @@ LOCAL_MAX_EVAL_BATCHES: int | None = None   # e.g. 50 to cap val batches locally
 LOCAL_USE_STREAM_MEMORY: bool = False        # True to test stream memory path
 LOCAL_MEMORY_ALPHA: float = 0.9             # EMA coefficient for stream memory (ablation: 0.7 / 0.9 / 0.95)
 LOCAL_TEST: bool = True                      # True to run A/B experiment instead of training
+# --- mini training run (only used when LOCAL_TRAIN=True) ---
+LOCAL_TRAIN: bool = False                    # True to train briefly then run stream memory eval
+LOCAL_TRAIN_ITERATIONS: int = 200            # steps; 200 * 65536 tok ≈ 13M tokens, ~5-10 min on M-series
+LOCAL_TRAIN_BATCH_TOKENS: int = 65536        # one microbatch (64 seqs x 1024); keeps Metal memory low
+LOCAL_GRAD_ACCUM_STEPS: int = 1             # no accumulation for simplicity
+LOCAL_WARMUP_STEPS: int = 5                 # prime Metal shaders without updating weights
 
 # TRAINING
 # -----------------------------
@@ -1157,14 +1168,133 @@ def main() -> None:
     log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
 
+def run_local_train_then_eval() -> None:
+    """Mini training run followed by stream memory A/B eval.
+    Trains a fresh model for LOCAL_TRAIN_ITERATIONS steps, then runs baseline vs
+    stream memory eval with the best local settings (alpha=0.70, clamp=15.0).
+
+    Set LOCAL_TRAIN=True and LOCAL_TEST=False to invoke from __main__.
+    All LOCAL_TRAIN_* constants are ignored by the official training path.
+    """
+    import sentencepiece as spm
+
+    # --- build a Hyperparameters instance and override training knobs locally ---
+    args = Hyperparameters()
+    args.iterations      = LOCAL_TRAIN_ITERATIONS
+    args.train_batch_tokens = LOCAL_TRAIN_BATCH_TOKENS
+    args.grad_accum_steps   = LOCAL_GRAD_ACCUM_STEPS
+    args.warmup_steps       = LOCAL_WARMUP_STEPS
+    args.val_loss_every     = 0            # no mid-training val scan
+    args.train_log_every    = 10           # print loss every 10 steps
+    args.max_wallclock_seconds = 0.0       # no wallclock cap during this run
+    args.warmdown_iters     = max(LOCAL_TRAIN_ITERATIONS // 5, 1)   # last 20% as warmdown
+
+    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+        sp, args.vocab_size
+    )
+
+    mx.random.seed(args.seed)
+    train_loader = TokenLoader(args.train_files, log_fn=None, dataset_name="")
+
+    model = GPT(
+        vocab_size=args.vocab_size, num_layers=args.num_layers, dim=args.model_dim,
+        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+        logit_chunk_tokens=args.logit_chunk_tokens, logit_softcap=args.logit_softcap,
+        rope_base=args.rope_base, tied_embed_init_std=args.tied_embed_init_std,
+        qk_gain_init=args.qk_gain_init,
+    )
+    opt = SplitOptimizers(model, args)
+    compiled_loss = mx.compile(lambda x, y: model.loss(x, y), inputs=model.state, outputs=model.state)
+    compiled_loss_and_grad = mx.compile(
+        nn.value_and_grad(model, lambda x, y: model.loss(x, y)),
+        inputs=model.state, outputs=model.state,
+    )
+
+    print(f"\n===== LOCAL MINI TRAINING ({LOCAL_TRAIN_ITERATIONS} steps, batch={LOCAL_TRAIN_BATCH_TOKENS} tok) =====")
+
+    # Warmup: prime Metal shaders without touching weights
+    if args.warmup_steps > 0:
+        print(f"  warming up Metal shaders ({args.warmup_steps} steps)...")
+        for _ in range(args.warmup_steps):
+            warmup_loss, warmup_grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
+            mx.eval(warmup_loss, warmup_grads)
+        train_loader = TokenLoader(args.train_files, log_fn=None, dataset_name="")  # reset
+        print(f"  warmup done — resetting data loader")
+
+    t_train = time.perf_counter()
+    for step in range(1, LOCAL_TRAIN_ITERATIONS + 1):
+        lr_mul = args.lr_mul(step - 1, 1000.0 * (time.perf_counter() - t_train))
+        accum: dict | None = None
+        train_loss = mx.array(0.0, dtype=mx.float32)
+        grad_scale = 1.0 / args.grad_accum_steps
+        for _ in range(args.grad_accum_steps):
+            loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
+            accum = accumulate_flat_grads(accum, grads, grad_scale)
+            train_loss = train_loss + loss.astype(mx.float32) * grad_scale
+            if args.mlx_eager_eval:
+                mx.eval(train_loss, accum)
+        grads = tree_unflatten(list(accum.items()))
+        grads = clip_grad_tree(grads, args.grad_clip_norm)
+        opt.step(model, grads, step=step - 1, lr_mul=lr_mul)
+        mx.synchronize()
+        if step % args.train_log_every == 0 or step == LOCAL_TRAIN_ITERATIONS:
+            elapsed = 1000.0 * (time.perf_counter() - t_train)
+            print(f"  step:{step}/{LOCAL_TRAIN_ITERATIONS}  train_loss:{float(train_loss.item()):.4f}  time:{elapsed:.0f}ms")
+
+    total_train_ms = 1000.0 * (time.perf_counter() - t_train)
+    print(f"  training done in {total_train_ms:.0f}ms")
+
+    # --- run stream memory A/B eval on the trained model ---
+    _cap   = 100
+    _alpha = 0.70
+    _clamp = 15.0
+    _mode  = "pre_x0"
+
+    print(f"\n===== POST-TRAINING STREAM MEMORY EVAL (cap={_cap}, alpha={_alpha}, clamp={_clamp}) =====")
+
+    print("\n===== BASELINE RUN =====")
+    t0 = time.perf_counter()
+    base_loss, base_bpb = eval_val(
+        args, compiled_loss, val_tokens,
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        max_eval_batches=_cap,
+        use_stream_memory=False,
+    )
+    print(f"  val_loss={base_loss:.4f}  val_bpb={base_bpb:.4f}  time={1000*(time.perf_counter()-t0):.0f}ms")
+
+    print("\n===== MEMORY RUN =====")
+    t1 = time.perf_counter()
+    mem_loss, mem_bpb = eval_val(
+        args, compiled_loss, val_tokens,
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        max_eval_batches=_cap,
+        use_stream_memory=True,
+        mem_alpha=_alpha,
+        max_mem_norm=_clamp,
+        mem_injection=_mode,
+        model=model,
+    )
+    print(f"  val_loss={mem_loss:.4f}  val_bpb={mem_bpb:.4f}  time={1000*(time.perf_counter()-t1):.0f}ms")
+
+    print("----- RESULT -----")
+    print(f"  training_steps={LOCAL_TRAIN_ITERATIONS}  batch_tokens={LOCAL_TRAIN_BATCH_TOKENS}")
+    print(f"  alpha={_alpha}  clamp={_clamp}  injection={_mode}")
+    print(f"  baseline_bpb={base_bpb:.4f}")
+    print(f"  memory_bpb={mem_bpb:.4f}")
+    print(f"  delta_bpb={mem_bpb - base_bpb:+.4f}  (negative = memory helps)")
+
+
 def run_local_experiment() -> None:
-    """Max-norm clamp ablation: alpha fixed at 0.70, varies clamp in one pass.
+    """Injection-point ablation: pre_x0 vs post_x0, alpha=0.70, clamp=15.0.
     Run with: LOCAL_TEST=True python train_gpt_mlx.py
     """
     import sentencepiece as spm
     _cap = 100           # batches per run
     _alpha = 0.70        # fixed
     _clamp = 15.0        # fixed
+    _modes = ["pre_x0", "post_x0"]
 
     args = Hyperparameters()
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
@@ -1192,28 +1322,34 @@ def run_local_experiment() -> None:
     )
     print(f"  val_loss={base_loss:.4f}  val_bpb={base_bpb:.4f}  time={1000*(time.perf_counter()-t0):.0f}ms")
 
-    print(f"\n===== MEMORY RUN (alpha={_alpha}, clamp={_clamp}) =====")
-    t1 = time.perf_counter()
-    mem_loss, mem_bpb = eval_val(
-        args, compiled_loss, val_tokens,
-        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        max_eval_batches=_cap,
-        use_stream_memory=True,
-        mem_alpha=_alpha,
-        max_mem_norm=_clamp,
-        model=model,
-    )
-    print(f"  val_loss={mem_loss:.4f}  val_bpb={mem_bpb:.4f}  time={1000*(time.perf_counter()-t1):.0f}ms")
+    for mode in _modes:
+        print(f"\n===== INJECTION MODE = {mode} (alpha={_alpha}, clamp={_clamp}) =====")
 
-    print("----- RESULT -----")
-    print(f"  clamp={_clamp}  alpha={_alpha}")
-    print(f"  baseline_bpb={base_bpb:.4f}")
-    print(f"  memory_bpb={mem_bpb:.4f}")
-    print(f"  delta_bpb={mem_bpb - base_bpb:+.4f}  (negative = memory helps)")
+        print("\n===== MEMORY RUN =====")
+        t1 = time.perf_counter()
+        mem_loss, mem_bpb = eval_val(
+            args, compiled_loss, val_tokens,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            max_eval_batches=_cap,
+            use_stream_memory=True,
+            mem_alpha=_alpha,
+            max_mem_norm=_clamp,
+            mem_injection=mode,
+            model=model,
+        )
+        print(f"  val_loss={mem_loss:.4f}  val_bpb={mem_bpb:.4f}  time={1000*(time.perf_counter()-t1):.0f}ms")
+
+        print("----- RESULT -----")
+        print(f"  injection_mode={mode}  alpha={_alpha}  clamp={_clamp}")
+        print(f"  baseline_bpb={base_bpb:.4f}")
+        print(f"  memory_bpb={mem_bpb:.4f}")
+        print(f"  delta_bpb={mem_bpb - base_bpb:+.4f}  (negative = memory helps)")
 
 
 if __name__ == "__main__":
-    if LOCAL_TEST:
+    if LOCAL_TRAIN:
+        run_local_train_then_eval()
+    elif LOCAL_TEST:
         run_local_experiment()
     else:
         main()

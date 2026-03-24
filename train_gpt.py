@@ -1068,29 +1068,22 @@ def main() -> None:
 
         if TRAIN_WITH_MEMORY:
             # Memory-aware training: same micro_steps as baseline for identical data throughput.
-            # Inject train_mem (from previous step) into all micro-steps.  On the last
-            # micro-step we also request return_final_hidden=True so we can update train_mem
-            # from the same forward pass — zero extra overhead vs baseline.
+            # Always call compiled_model with return_final_hidden=True so torch.compile sees a
+            # single static graph (no branching = no recompilation). final_h from earlier
+            # micro-steps is simply discarded; only the last one is used for the EMA update.
             final_h: Tensor | None = None
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                is_last = micro_step == grad_accum_steps - 1
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    if is_last:
-                        # Use compiled_model directly to get return_final_hidden — safe for
-                        # single-GPU; distributed grad-sync still fires because backward()
-                        # honours the DDP no_sync context set above via require_backward_grad_sync.
-                        loss, final_h = compiled_model(
-                            x, y, memory=train_mem, inject_scale=MEM_INJECT_SCALE, return_final_hidden=True
-                        )
-                    else:
-                        loss = model(x, y, memory=train_mem, inject_scale=MEM_INJECT_SCALE)
+                    loss, final_h = compiled_model(
+                        x, y, memory=train_mem, inject_scale=MEM_INJECT_SCALE, return_final_hidden=True
+                    )
                 train_loss += loss.detach()
                 (loss * grad_scale).backward()
             train_loss /= grad_accum_steps
-            # Update train_mem from the last micro-step's already-computed hidden state.
+            # Update train_mem from the last micro-step's hidden state.
             new_signal = final_h.float().mean(dim=1).detach()  # type: ignore[union-attr]  # (B, D)
             if train_mem is None or train_mem.shape != new_signal.shape:
                 train_mem = torch.zeros_like(new_signal)

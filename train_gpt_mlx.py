@@ -437,6 +437,9 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
+        # later_residual: inject at U-Net bottleneck (after all encoder layers, before decoder)
+        if memory is not None and injection_mode == "later_residual":
+            x = x + _scaled_memory(x)
         for i in range(self.num_decoder_layers):
             # Odd layer counts have one more decoder block than encoder block. The baseline only
             # applies a skip connection when one exists, then runs the remaining decoder block(s)
@@ -889,11 +892,12 @@ LOCAL_MEMORY_ALPHA: float = 0.9             # EMA coefficient for stream memory 
 LOCAL_TEST: bool = True                      # True to run A/B experiment instead of training
 # --- mini training run (only used when LOCAL_TRAIN=True) ---
 LOCAL_TRAIN: bool = True                     # True to train briefly then run stream memory eval
-LOCAL_TRAIN_ITERATIONS: int = 50             # steps; 50 * 65536 tok ≈ 3M tokens, fast probe run
+LOCAL_TRAIN_ITERATIONS: int = 100            # steps; 100 * 65536 tok ≈ 6M tokens, confirmation run
 LOCAL_TRAIN_BATCH_TOKENS: int = 65536        # one microbatch (64 seqs x 1024); keeps Metal memory low
 LOCAL_GRAD_ACCUM_STEPS: int = 1             # no accumulation for simplicity
 LOCAL_WARMUP_STEPS: int = 5                 # prime Metal shaders without updating weights
 LOCAL_MEMORY_INJECT_SCALE: float = 0.1      # fraction of embedding norm to inject as memory signal
+LOCAL_TRAIN_WITH_MEMORY: bool = True        # inject stream memory during local training so model can learn to use it
 
 # TRAINING
 # -----------------------------
@@ -1233,7 +1237,17 @@ def run_local_train_then_eval() -> None:
         inputs=model.state, outputs=model.state,
     )
 
-    print(f"\n===== LOCAL MINI TRAINING ({LOCAL_TRAIN_ITERATIONS} steps, batch={LOCAL_TRAIN_BATCH_TOKENS} tok) =====")
+    print(f"\n===== LOCAL MINI TRAINING ({LOCAL_TRAIN_ITERATIONS} steps, batch={LOCAL_TRAIN_BATCH_TOKENS} tok"
+          + (", WITH_MEMORY=later_residual" if LOCAL_TRAIN_WITH_MEMORY else "") + ") =====")
+
+    # Best-config memory settings — used both during memory-aware training and post-training eval
+    _mem_alpha   = 0.70
+    _mem_clamp   = 15.0
+    _inj_mode    = "later_residual"
+    _inj_scale   = 0.02
+    _mem_summary = "mean_all_tokens"
+    # Persistent stream memory state (None until first chunk is processed)
+    train_mem: "mx.array | None" = None
 
     # Warmup: prime Metal shaders without touching weights
     if args.warmup_steps > 0:
@@ -1247,36 +1261,73 @@ def run_local_train_then_eval() -> None:
     t_train = time.perf_counter()
     for step in range(1, LOCAL_TRAIN_ITERATIONS + 1):
         lr_mul = args.lr_mul(step - 1, 1000.0 * (time.perf_counter() - t_train))
-        accum: dict | None = None
-        train_loss = mx.array(0.0, dtype=mx.float32)
-        grad_scale = 1.0 / args.grad_accum_steps
-        for _ in range(args.grad_accum_steps):
-            loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
-            accum = accumulate_flat_grads(accum, grads, grad_scale)
-            train_loss = train_loss + loss.astype(mx.float32) * grad_scale
-            if args.mlx_eager_eval:
-                mx.eval(train_loss, accum)
-        grads = tree_unflatten(list(accum.items()))
-        grads = clip_grad_tree(grads, args.grad_clip_norm)
-        opt.step(model, grads, step=step - 1, lr_mul=lr_mul)
-        mx.synchronize()
+
+        if LOCAL_TRAIN_WITH_MEMORY:
+            # --- memory-aware training step ---
+            # Use one microbatch per step to keep peak memory low during backward.
+            x, y = train_loader.next_batch(args.mlx_max_microbatch_tokens, args.train_seq_len)
+
+            # Phase 1: forward-only pass to update train_mem (no weight gradient needed)
+            _h = model(x, memory=train_mem, injection_mode=_inj_mode, inject_scale=_inj_scale)
+            _new_sig = _h.mean(axis=1).astype(mx.float32)  # (B, D)
+            mx.eval(_new_sig)
+            _B, _D = _new_sig.shape
+            if train_mem is None or train_mem.shape != (_B, _D):
+                train_mem = mx.zeros((_B, _D))
+            train_mem = _mem_alpha * train_mem + (1.0 - _mem_alpha) * _new_sig
+            _norms = mx.sqrt((train_mem ** 2).sum(axis=1, keepdims=True))
+            train_mem = mx.where(_norms > _mem_clamp, train_mem * (_mem_clamp / (_norms + 1e-8)), train_mem)
+            mx.eval(train_mem)
+
+            # Phase 2: loss + gradient with updated memory (second forward, with grad tape)
+            _cur_mem = train_mem  # capture current value for closure
+            def _mem_step_loss(x, y):
+                h = model(x, memory=_cur_mem, injection_mode=_inj_mode, inject_scale=_inj_scale)
+                flat = h.reshape(-1, model.tok_emb.weight.shape[1])
+                logits = model.softcap(flat @ model.tok_emb.weight.astype(flat.dtype).T)
+                return nn.losses.cross_entropy(logits.astype(mx.float32), y.reshape(-1), reduction="mean")
+            train_loss, grads = nn.value_and_grad(model, _mem_step_loss)(x, y)
+            mx.eval(train_loss, grads)
+            grads = clip_grad_tree(grads, args.grad_clip_norm)
+            opt.step(model, grads, step=step - 1, lr_mul=lr_mul)
+            mx.synchronize()
+
+        else:
+            # --- standard training step (unchanged) ---
+            accum: dict | None = None
+            train_loss = mx.array(0.0, dtype=mx.float32)
+            grad_scale = 1.0 / args.grad_accum_steps
+            for _ in range(args.grad_accum_steps):
+                loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
+                accum = accumulate_flat_grads(accum, grads, grad_scale)
+                train_loss = train_loss + loss.astype(mx.float32) * grad_scale
+                if args.mlx_eager_eval:
+                    mx.eval(train_loss, accum)
+            grads = tree_unflatten(list(accum.items()))
+            grads = clip_grad_tree(grads, args.grad_clip_norm)
+            opt.step(model, grads, step=step - 1, lr_mul=lr_mul)
+            mx.synchronize()
+
         if step % args.train_log_every == 0 or step == LOCAL_TRAIN_ITERATIONS:
             elapsed = 1000.0 * (time.perf_counter() - t_train)
-            print(f"  step:{step}/{LOCAL_TRAIN_ITERATIONS}  train_loss:{float(train_loss.item()):.4f}  time:{elapsed:.0f}ms")
+            _mem_tag = ""
+            if LOCAL_TRAIN_WITH_MEMORY and train_mem is not None:
+                _mn = float(mx.sqrt((train_mem ** 2).sum(axis=1)).mean().item())
+                _mem_tag = f"  mem_norm={_mn:.2f}"
+            print(f"  step:{step}/{LOCAL_TRAIN_ITERATIONS}  train_loss:{float(train_loss.item()):.4f}  time:{elapsed:.0f}ms{_mem_tag}")
 
     total_train_ms = 1000.0 * (time.perf_counter() - t_train)
     print(f"  training done in {total_train_ms:.0f}ms")
 
-    # --- run stream memory A/B eval on the trained model ---
-    _cap   = 100
-    _alpha = 0.70
-    _clamp = 15.0
-    _mode  = "pre_x0"
+    # --- best-config confirmation run (single baseline + single memory eval) ---
+    _cap          = 100
+    # reuse _mem_alpha, _mem_clamp, _inj_mode, _inj_scale, _mem_summary from training config above
+    _inject_scale = _inj_scale
+    _summary      = _mem_summary
 
-    _inject_scale  = 0.02                                              # fixed for summary-mode ablation
-    _summary_modes = ["mean_all_tokens", "last_token", "mean_last_quarter"]  # ablation grid
-
-    print(f"\n===== POST-TRAINING STREAM MEMORY EVAL (cap={_cap}, alpha={_alpha}, clamp={_clamp}, inject_scale={_inject_scale}) =====")
+    print(f"\n===== POST-TRAINING BEST-CONFIG CONFIRMATION "
+          f"(cap={_cap}, alpha={_mem_alpha}, clamp={_mem_clamp}, inject_scale={_inject_scale}, "
+          f"inj={_inj_mode}) =====")
 
     print("\n===== BASELINE RUN =====")
     t0 = time.perf_counter()
@@ -1288,74 +1339,29 @@ def run_local_train_then_eval() -> None:
     )
     print(f"  val_loss={base_loss:.4f}  val_bpb={base_bpb:.4f}  time={1000*(time.perf_counter()-t0):.0f}ms")
 
-    # --- summary mode ablation loop ---
-    import io, re as _re, sys as _sys
+    print("\n===== MEMORY RUN (later_residual) =====")
+    t1 = time.perf_counter()
+    mem_loss, mem_bpb = eval_val(
+        args, compiled_loss, val_tokens,
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        max_eval_batches=_cap,
+        use_stream_memory=True,
+        mem_alpha=_mem_alpha,
+        max_mem_norm=_mem_clamp,
+        mem_injection=_inj_mode,
+        inject_scale=_inject_scale,
+        mem_summary=_summary,
+        model=model,
+    )
+    print(f"  val_loss={mem_loss:.4f}  val_bpb={mem_bpb:.4f}  time={1000*(time.perf_counter()-t1):.0f}ms")
 
-    def _run_summary(_summary: str) -> dict:
-        """Run one memory eval with a given summary mode, capture diagnostics, return result dict."""
-        _buf = io.StringIO()
-        _saved_stdout = _sys.stdout
-        _sys.stdout = _buf
-        t1 = time.perf_counter()
-        try:
-            mem_loss, mem_bpb = eval_val(
-                args, compiled_loss, val_tokens,
-                base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                max_eval_batches=_cap,
-                use_stream_memory=True,
-                mem_alpha=_alpha,
-                max_mem_norm=_clamp,
-                mem_injection=_mode,
-                inject_scale=_inject_scale,
-                mem_summary=_summary,
-                model=model,
-            )
-        finally:
-            _sys.stdout = _saved_stdout
-        _elapsed_ms = 1000 * (time.perf_counter() - t1)
-
-        # Re-emit captured output so per-batch [Memory] lines remain visible
-        _captured = _buf.getvalue()
-        print(_captured, end="")
-
-        # Parse eff_inject_ratio from [Memory] lines: "batch=N ... eff_inject_ratio=X"
-        _ratios: dict[int, float] = {}
-        for _m in _re.finditer(r"\[Memory\] batch=(\d+).*?eff_inject_ratio=([0-9.]+)", _captured):
-            _ratios[int(_m.group(1))] = float(_m.group(2))
-
-        return {
-            "summary":     _summary,
-            "memory_bpb":  mem_bpb,
-            "delta_bpb":   mem_bpb - base_bpb,
-            "ratio_b0":    _ratios.get(0),
-            "ratio_b50":   _ratios.get(50),
-            "time_ms":     _elapsed_ms,
-        }
-
-    print(f"\n===== SUMMARY MODE ABLATION (modes={_summary_modes}) =====")
-    _results = []
-    for _summary in _summary_modes:
-        print(f"\n----- summary={_summary} -----")
-        _r = _run_summary(_summary)
-        _results.append(_r)
-        print(f"  val_bpb={_r['memory_bpb']:.4f}  delta_bpb={_r['delta_bpb']:+.4f}  time={_r['time_ms']:.0f}ms")
-
-    # --- structured summary table ---
-    print("\n===== SUMMARY MODE RESULTS =====\n")
-    _hdr = f"{'summary_mode':<20} | {'memory_bpb':>10} | {'delta_bpb':>9} | {'ratio_b0':>8} | {'ratio_b50':>9} | {'time_ms':>8}"
-    print(_hdr)
-    print("-" * len(_hdr))
-    for _r in _results:
-        _rb0  = f"{_r['ratio_b0']:.4f}"  if _r['ratio_b0']  is not None else "    N/A"
-        _rb50 = f"{_r['ratio_b50']:.4f}" if _r['ratio_b50'] is not None else "    N/A"
-        print(
-            f"{_r['summary']:<20} | {_r['memory_bpb']:>10.4f} | {_r['delta_bpb']:>+9.4f} | "
-            f"{_rb0:>8} | {_rb50:>9} | {_r['time_ms']:>7.0f}ms"
-        )
-    print()
-    print(f"  baseline_bpb={base_bpb:.4f}  training_steps={LOCAL_TRAIN_ITERATIONS}  "
-          f"batch_tokens={LOCAL_TRAIN_BATCH_TOKENS}  alpha={_alpha}  clamp={_clamp}  "
-          f"inject_scale={_inject_scale}  injection={_mode}")
+    print("\n===== RESULT =====")
+    print(f"  baseline_bpb={base_bpb:.4f}")
+    print(f"  memory_bpb  ={mem_bpb:.4f}")
+    print(f"  delta_bpb   ={mem_bpb - base_bpb:+.4f}  (negative = memory helps)")
+    print(f"  training_steps={LOCAL_TRAIN_ITERATIONS}  batch_tokens={LOCAL_TRAIN_BATCH_TOKENS}  "
+          f"alpha={_mem_alpha}  clamp={_mem_clamp}  inject_scale={_inject_scale}  "
+          f"inj={_inj_mode}  summary={_summary}  train_with_memory={LOCAL_TRAIN_WITH_MEMORY}")
 
 
 def run_local_experiment() -> None:

@@ -267,8 +267,9 @@ def eval_val(
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 if use_stream_memory:
-                    # Access underlying GPT for set_memory/extract_mem_signal (compiled wrapper lacks them).
-                    _gpt = model._orig_mod if hasattr(model, "_orig_mod") else model
+                    # Unwrap DDP (if present) then torch.compile wrapper to reach the GPT.
+                    _m = model.module if isinstance(model, DDP) else model
+                    _gpt: GPT = _m._orig_mod if hasattr(_m, "_orig_mod") else _m  # type: ignore[assignment]
                     if doc_memory is not None:
                         _gpt.set_memory(doc_memory)
                     batch_loss = model(x, y)
@@ -279,8 +280,9 @@ def eval_val(
             if use_stream_memory:
                 # V2 EMA update in mem_dim space.
                 if doc_memory is None:
-                    _gpt = model._orig_mod if hasattr(model, "_orig_mod") else model
-                    doc_memory = torch.zeros(1, _gpt.mem_proj_in.out_features, device=x.device, dtype=torch.float32)
+                    _m2 = model.module if isinstance(model, DDP) else model
+                    _gpt2: GPT = _m2._orig_mod if hasattr(_m2, "_orig_mod") else _m2  # type: ignore[assignment]
+                    doc_memory = torch.zeros(1, _gpt2.mem_proj_in.out_features, device=x.device, dtype=torch.float32)
                 doc_memory = (_mem_alpha * doc_memory + (1.0 - _mem_alpha) * mem_signal.detach().mean(0, keepdim=True)).detach()
                 if eval_step % 50 == 0:
                     print(f"[Memory] eval_step={eval_step} norm={doc_memory.norm().item():.4f}")
@@ -1054,8 +1056,8 @@ def main() -> None:
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     if TRAIN_WITH_MEMORY:
-                        base_model.set_memory(train_mem)  # update buffer before compiled call
-                        warmup_loss = compiled_model(x, y)  # identical signature to baseline
+                        base_model.set_memory(train_mem)  # update buffer before forward
+                        warmup_loss = model(x, y)  # use model() so DDP grad-sync hooks fire
                     else:
                         warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
@@ -1136,7 +1138,7 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    loss = compiled_model(x, y)  # no memory arg — baseline-identical
+                    loss = model(x, y)  # use model() so DDP grad-sync hooks fire
                 train_loss += loss.detach()
                 (loss * grad_scale).backward()
                 last_x = x

@@ -768,7 +768,11 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         loss = F.cross_entropy(logits.float(), targets, reduction="mean")
         if return_final_hidden:
-            return loss, final_h
+            # Detach final_h *inside* the compiled graph so autograd does not route
+            # gradients back through it during loss.backward().  Without this, the
+            # backward has to compute d_loss/d_final_h (a full LM-head backward), which
+            # roughly doubles the effective backward cost and causes ~5x step-time overhead.
+            return loss, final_h.detach()
         return loss
 
 

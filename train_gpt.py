@@ -765,7 +765,7 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        if self.with_memory:
+        if memory is not None:
             # V2: extract last-token hidden state (view, no copy), project to mem_dim.
             # Detach inside the compiled graph — no gradient flows back through this output.
             # Returning (B, 16) is negligible overhead vs V1's (B, T, D).
@@ -994,12 +994,22 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
+    # V2 memory: initialize train_mem before warmup so the baseline warmup compiles
+    # the correct graph variant (memory=Tensor) — the same one used throughout training.
+    # This is a static zero tensor; the compiled graph sees a Tensor every call (no None
+    # guard flip mid-training).  Always returns (loss, mem_signal).
+    if TRAIN_WITH_MEMORY:
+        _local_batch = args.train_batch_tokens // (world_size * grad_accum_steps * args.train_seq_len)
+        _mem_dim = base_model.mem_proj_in.out_features
+        train_mem = torch.zeros(_local_batch, _mem_dim, device=device, dtype=torch.float32)
+
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
+        log0(f"warmup_steps:{args.warmup_steps}")
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
@@ -1007,7 +1017,10 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    if TRAIN_WITH_MEMORY:
+                        warmup_loss, _ = compiled_model(x, y, memory=train_mem)
+                    else:
+                        warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1021,34 +1034,9 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-
-    # V2 memory: prime the single compiled graph variant before the timed window so
-    # torch.compile autotunes its Triton kernels upfront.  train_mem is a small (B, 16)
-    # zero tensor — always passed as a Tensor so the compiled graph is static (no None
-    # guard recompile mid-training).  Single graph variant: always returns (loss, mem_signal).
-    if TRAIN_WITH_MEMORY:
-        _local_batch = args.train_batch_tokens // (world_size * grad_accum_steps * args.train_seq_len)
-        _mem_dim = base_model.mem_proj_in.out_features
-        train_mem = torch.zeros(_local_batch, _mem_dim, device=device, dtype=torch.float32)
-        if args.warmup_steps > 0:
-            log0(f"memory_warmup_steps:{args.warmup_steps}")
-            for _ in range(args.warmup_steps):
-                zero_grad_all()
-                for micro_step in range(grad_accum_steps):
-                    x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                        loss, mem_signal = compiled_model(x, y, memory=train_mem)
-                    (loss * grad_scale).backward()
-                zero_grad_all()
-                train_mem = (_mem_alpha * train_mem + (1.0 - _mem_alpha) * mem_signal.detach()).detach()
-            # Restore clean model & optimiser state for proper timed training.
-            base_model.load_state_dict(initial_model_state, strict=True)
-            for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
-                opt.load_state_dict(state)
-            zero_grad_all()
-            train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        # Reset memory to zeros so the timed run begins with a clean (zero) state.
-        train_mem = torch.zeros(_local_batch, _mem_dim, device=device, dtype=torch.float32)
+        # Reset memory to zeros so the timed run begins with a clean state.
+        if TRAIN_WITH_MEMORY:
+            train_mem = torch.zeros(_local_batch, _mem_dim, device=device, dtype=torch.float32)
 
     # -----------------------------
     # MAIN TRAINING LOOP

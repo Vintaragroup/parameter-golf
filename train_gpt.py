@@ -794,7 +794,7 @@ def main() -> None:
     MEM_INJECT_SCALE: float = float(os.environ.get("MEM_INJECT_SCALE", "0.10"))
     _mem_alpha: float = 0.70
     _mem_clamp: float = 15.0
-    train_mem: Tensor | None = None
+    train_mem: Tensor | None = None  # initialized to zeros in memory-warmup block below
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
@@ -1017,6 +1017,39 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
+    # Prime the memory graph before the timed window so torch.compile autotunes its Triton
+    # kernels upfront.  Crucially, train_mem is initialised to a zero tensor (not None) so
+    # that compiled_model always receives a Tensor argument – preventing the None→Tensor
+    # guard flip at step 1 that would otherwise trigger a full graph recompile mid-training.
+    if TRAIN_WITH_MEMORY:
+        _local_batch = args.train_batch_tokens // (world_size * grad_accum_steps * args.train_seq_len)
+        _embed_dim = base_model.tok_emb.embedding_dim
+        train_mem = torch.zeros(_local_batch, _embed_dim, device=device, dtype=torch.float32)
+        if args.warmup_steps > 0:
+            log0(f"memory_warmup_steps:{args.warmup_steps}")
+            for _ in range(args.warmup_steps):
+                zero_grad_all()
+                for micro_step in range(grad_accum_steps):
+                    x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        loss, final_h = compiled_model(
+                            x, y, memory=train_mem, inject_scale=MEM_INJECT_SCALE, return_final_hidden=True
+                        )
+                    (loss * grad_scale).backward()
+                zero_grad_all()
+                new_signal = final_h.float().mean(dim=1).detach()
+                train_mem = (_mem_alpha * train_mem + (1.0 - _mem_alpha) * new_signal).detach()
+                _norms = train_mem.norm(dim=-1, keepdim=True)
+                train_mem = torch.where(_norms > _mem_clamp, train_mem * _mem_clamp / (_norms + 1e-8), train_mem)
+            # Restore clean model & optimiser state for proper timed training.
+            base_model.load_state_dict(initial_model_state, strict=True)
+            for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
+                opt.load_state_dict(state)
+            zero_grad_all()
+            train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        # Reset memory to zeros so the timed run begins with a clean (zero) state.
+        train_mem = torch.zeros(_local_batch, _embed_dim, device=device, dtype=torch.float32)
+
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
@@ -1085,9 +1118,7 @@ def main() -> None:
             train_loss /= grad_accum_steps
             # Update train_mem from the last micro-step's hidden state.
             new_signal = final_h.float().mean(dim=1).detach()  # type: ignore[union-attr]  # (B, D)
-            if train_mem is None or train_mem.shape != new_signal.shape:
-                train_mem = torch.zeros_like(new_signal)
-            train_mem = (_mem_alpha * train_mem + (1.0 - _mem_alpha) * new_signal).detach()
+            train_mem = (_mem_alpha * train_mem + (1.0 - _mem_alpha) * new_signal).detach()  # type: ignore[operator]
             _norms = train_mem.norm(dim=-1, keepdim=True)
             train_mem = torch.where(_norms > _mem_clamp, train_mem * _mem_clamp / (_norms + 1e-8), train_mem)
         else:

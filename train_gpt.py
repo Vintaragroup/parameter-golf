@@ -267,16 +267,21 @@ def eval_val(
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 if use_stream_memory:
-                    batch_loss = model(x, y, memory=doc_memory)
-                    mem_signal = model.extract_mem_signal(x, doc_memory)
+                    # Access underlying GPT for set_memory/extract_mem_signal (compiled wrapper lacks them).
+                    _gpt = model._orig_mod if hasattr(model, "_orig_mod") else model
+                    if doc_memory is not None:
+                        _gpt.set_memory(doc_memory)
+                    batch_loss = model(x, y)
+                    mem_signal = _gpt.extract_mem_signal(x)
                 else:
                     batch_loss = model(x, y)
                 batch_loss = batch_loss.detach()
             if use_stream_memory:
                 # V2 EMA update in mem_dim space.
                 if doc_memory is None:
-                    doc_memory = torch.zeros_like(mem_signal)
-                doc_memory = (_mem_alpha * doc_memory + (1.0 - _mem_alpha) * mem_signal.detach()).detach()
+                    _gpt = model._orig_mod if hasattr(model, "_orig_mod") else model
+                    doc_memory = torch.zeros(1, _gpt.mem_proj_in.out_features, device=x.device, dtype=torch.float32)
+                doc_memory = (_mem_alpha * doc_memory + (1.0 - _mem_alpha) * mem_signal.detach().mean(0, keepdim=True)).detach()
                 if eval_step % 50 == 0:
                     print(f"[Memory] eval_step={eval_step} norm={doc_memory.norm().item():.4f}")
             batch_token_count = float(y.numel())
@@ -719,6 +724,11 @@ class GPT(nn.Module):
             self.mem_proj_in = CastedLinear(model_dim, mem_dim, bias=False)
             self.mem_proj_out = CastedLinear(mem_dim, model_dim, bias=False)
             self.mem_proj_out._zero_init = True
+            # mem_buffer: holds current EMA memory state, updated in-place from outside
+            # the compiled graph. Shape (1, mem_dim) broadcasts over (B, T, D).
+            # Treated as captured module state by torch.compile (like a weight),
+            # so the compiled forward signature stays (input_ids, target_ids) — baseline-identical.
+            self.register_buffer("mem_buffer", torch.zeros(1, mem_dim, dtype=torch.float32), persistent=False)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -728,12 +738,17 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def set_memory(self, mem: Tensor) -> None:
+        """Update mem_buffer in-place from outside the compiled graph.
+        mem: (B, mem_dim) or (1, mem_dim) float32 on device."""
+        if mem.dim() == 2 and mem.size(0) > 1:
+            mem = mem.mean(0, keepdim=True)  # pool batch dim → (1, mem_dim)
+        self.mem_buffer.copy_(mem)
+
     def forward(
         self,
         input_ids: Tensor,
         target_ids: Tensor,
-        *,
-        memory: Tensor | None = None,
     ):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -744,12 +759,13 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
-        # later_residual: inject cross-chunk memory at U-Net bottleneck.
-        # V2: memory is (B, mem_dim=16). Project to model_dim and broadcast over T.
-        # mem_proj_out is zero-inited so injection starts as a no-op and grows via backprop.
-        # No-op when memory is None (baseline path — zero overhead, no guard on the tensor).
-        if memory is not None:
-            x = x + self.mem_proj_out(memory.to(x.dtype)).unsqueeze(1)  # (B, 1, D) broadcasts over T
+        # Memory injection at U-Net bottleneck.
+        # mem_buffer is (1, mem_dim), updated in-place before each compiled call.
+        # mem_proj_out is zero-inited → injection starts as no-op and grows via backprop.
+        # The compiled forward signature is (input_ids, target_ids) — identical to baseline,
+        # so Triton fusion is fully preserved.
+        if self.with_memory:
+            x = x + self.mem_proj_out(self.mem_buffer.to(x.dtype)).unsqueeze(1)  # (1, 1, D) → (B, T, D)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
@@ -768,9 +784,10 @@ class GPT(nn.Module):
         loss = F.cross_entropy(logits.float(), targets, reduction="mean")
         return loss
 
-    def extract_mem_signal(self, input_ids: Tensor, memory: Tensor | None) -> Tensor:
+    def extract_mem_signal(self, input_ids: Tensor) -> Tensor:
         """Run a no_grad forward to extract mem_proj_in(last_token_hidden). (B, mem_dim).
-        Called OUTSIDE the compiled graph — no impact on training fusions."""
+        Called OUTSIDE the compiled graph — no impact on training fusions.
+        mem_buffer must be set via set_memory() before calling if injection is desired."""
         with torch.no_grad():
             x = self.tok_emb(input_ids)
             x = F.rms_norm(x, (x.size(-1),))
@@ -779,8 +796,8 @@ class GPT(nn.Module):
             for i in range(self.num_encoder_layers):
                 x = self.blocks[i](x, x0)
                 skips.append(x)
-            if memory is not None:
-                x = x + self.mem_proj_out(memory.to(x.dtype)).unsqueeze(1)
+            if self.with_memory:
+                x = x + self.mem_proj_out(self.mem_buffer.to(x.dtype)).unsqueeze(1)
             for i in range(self.num_decoder_layers):
                 if skips:
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
@@ -915,8 +932,8 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    # Compile signal extraction as a separate graph (no loss, no backward) so it runs
-    # at Triton speed instead of slow eager mode (~30ms vs ~400ms per call).
+    # Compile signal extraction as a separate no-grad graph.
+    # extract_mem_signal reads mem_buffer (already set) — no extra args needed.
     compiled_extract = torch.compile(base_model.extract_mem_signal, dynamic=False, fullgraph=True) if TRAIN_WITH_MEMORY else None
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1014,13 +1031,13 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
-    # V2 memory: initialize train_mem before warmup so compiled graph always receives
-    # a Tensor (no None→Tensor guard flip mid-training).  Compiled graph returns only
-    # loss — signal extraction is a separate no_grad call outside the compiled scope.
+    # V2 memory: train_mem is the EMA state (1, mem_dim), kept on device.
+    # Updated in-place into base_model.mem_buffer before each compiled_model call.
+    # compiled_model call signature is (input_ids, target_ids) — identical to baseline,
+    # so Triton fusion is fully preserved.
     if TRAIN_WITH_MEMORY:
-        _local_batch = args.train_batch_tokens // (world_size * grad_accum_steps * args.train_seq_len)
         _mem_dim = base_model.mem_proj_in.out_features
-        train_mem = torch.zeros(_local_batch, _mem_dim, device=device, dtype=torch.float32)
+        train_mem = torch.zeros(1, _mem_dim, device=device, dtype=torch.float32)
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1037,7 +1054,8 @@ def main() -> None:
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     if TRAIN_WITH_MEMORY:
-                        warmup_loss = compiled_model(x, y, memory=train_mem)
+                        base_model.set_memory(train_mem)  # update buffer before compiled call
+                        warmup_loss = compiled_model(x, y)  # identical signature to baseline
                     else:
                         warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
@@ -1055,7 +1073,8 @@ def main() -> None:
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
         # Reset memory to zeros so the timed run begins with a clean state.
         if TRAIN_WITH_MEMORY:
-            train_mem = torch.zeros(_local_batch, _mem_dim, device=device, dtype=torch.float32)
+            train_mem = torch.zeros(1, _mem_dim, device=device, dtype=torch.float32)
+            base_model.set_memory(train_mem)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1107,25 +1126,26 @@ def main() -> None:
         train_loss = torch.zeros((), device=device)
 
         if TRAIN_WITH_MEMORY:
-            # V2 memory: compiled graph returns only loss (baseline-identical fusion).
-            # Signal extraction is a separate no_grad forward on the last microbatch's
-            # input, run outside the compiled graph every MEM_UPDATE_EVERY steps.
+            # V2 memory: buffer-based injection — compiled_model(x, y) has baseline-identical
+            # signature, so Triton fusion is fully preserved.
+            # train_mem is (1, mem_dim); set into mem_buffer before compiled call.
+            base_model.set_memory(train_mem)
             last_x: Tensor | None = None
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    loss = compiled_model(x, y, memory=train_mem)
+                    loss = compiled_model(x, y)  # no memory arg — baseline-identical
                 train_loss += loss.detach()
                 (loss * grad_scale).backward()
-                last_x = x  # remember last microbatch input for signal extraction
+                last_x = x
             train_loss /= grad_accum_steps
             # EMA update every MEM_UPDATE_EVERY steps via separate compiled no_grad forward.
             if step % MEM_UPDATE_EVERY == 0:
                 with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    mem_signal = compiled_extract(last_x, train_mem)  # (B, mem_dim), Triton-fast
-                train_mem = (_mem_alpha * train_mem + (1.0 - _mem_alpha) * mem_signal.detach()).detach()
+                    mem_signal = compiled_extract(last_x)  # (B, mem_dim)
+                train_mem = (_mem_alpha * train_mem + (1.0 - _mem_alpha) * mem_signal.detach().mean(0, keepdim=True)).detach()
         else:
             for micro_step in range(grad_accum_steps):
                 if distributed:

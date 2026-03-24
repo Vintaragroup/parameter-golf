@@ -1067,9 +1067,19 @@ def main() -> None:
         train_loss = torch.zeros((), device=device)
 
         if TRAIN_WITH_MEMORY:
-            # Memory-aware training: single microbatch per step.
-            # Phase 1 — inference-only forward to build train_mem (no grad needed, use base_model).
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            # Memory-aware training: same micro_steps as baseline for identical data throughput.
+            # Inject train_mem (from previous step) into all micro-steps, then update train_mem
+            # with one extra no-grad forward on the last micro-step's batch.
+            for micro_step in range(grad_accum_steps):
+                if distributed:
+                    model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    loss = model(x, y, memory=train_mem, inject_scale=MEM_INJECT_SCALE)
+                train_loss += loss.detach()
+                (loss * grad_scale).backward()
+            train_loss /= grad_accum_steps
+            # Update train_mem from the last micro-step's batch (inference-only, no grad).
             with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 _, final_h = base_model(x, y, memory=train_mem, inject_scale=MEM_INJECT_SCALE, return_final_hidden=True)
             new_signal = final_h.float().mean(dim=1).detach()  # (B, D)
@@ -1078,11 +1088,6 @@ def main() -> None:
             train_mem = (_mem_alpha * train_mem + (1.0 - _mem_alpha) * new_signal).detach()
             _norms = train_mem.norm(dim=-1, keepdim=True)
             train_mem = torch.where(_norms > _mem_clamp, train_mem * _mem_clamp / (_norms + 1e-8), train_mem)
-            # Phase 2 — forward with updated train_mem, compute loss and grad.
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y, memory=train_mem, inject_scale=MEM_INJECT_SCALE)
-            train_loss = loss.detach()
-            loss.backward()
         else:
             for micro_step in range(grad_accum_steps):
                 if distributed:

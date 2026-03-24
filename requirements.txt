@@ -1,10 +1,10 @@
 numpy
 tqdm
-torch
+torch>=2.4.0
 huggingface-hub
 kernels
 setuptools
-typing-extensions==4.15.0
+typing-extensions>=4.10.0
 datasets
 tiktoken
 sentencepiece

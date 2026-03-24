@@ -915,6 +915,9 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    # Compile signal extraction as a separate graph (no loss, no backward) so it runs
+    # at Triton speed instead of slow eager mode (~30ms vs ~400ms per call).
+    compiled_extract = torch.compile(base_model.extract_mem_signal, dynamic=False, fullgraph=True) if TRAIN_WITH_MEMORY else None
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -1118,12 +1121,10 @@ def main() -> None:
                 (loss * grad_scale).backward()
                 last_x = x  # remember last microbatch input for signal extraction
             train_loss /= grad_accum_steps
-            # EMA update every MEM_UPDATE_EVERY steps via separate no_grad forward.
+            # EMA update every MEM_UPDATE_EVERY steps via separate compiled no_grad forward.
             if step % MEM_UPDATE_EVERY == 0:
-                base_model.eval()
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    mem_signal = base_model.extract_mem_signal(last_x, train_mem)  # (B, mem_dim)
-                base_model.train()
+                with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    mem_signal = compiled_extract(last_x, train_mem)  # (B, mem_dim), Triton-fast
                 train_mem = (_mem_alpha * train_mem + (1.0 - _mem_alpha) * mem_signal.detach()).detach()
         else:
             for micro_step in range(grad_accum_steps):

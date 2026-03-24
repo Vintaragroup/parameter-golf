@@ -796,6 +796,7 @@ def main() -> None:
     # inject_scale=0.02 for a conservative first CUDA confirmation.
     TRAIN_WITH_MEMORY: bool = os.environ.get("TRAIN_WITH_MEMORY", "0") == "1"
     MEM_INJECT_SCALE: float = float(os.environ.get("MEM_INJECT_SCALE", "0.10"))
+    MEM_UPDATE_EVERY: int = int(os.environ.get("MEM_UPDATE_EVERY", "1"))  # update train_mem every N steps
     _mem_alpha: float = 0.70
     _mem_clamp: float = 15.0
     train_mem: Tensor | None = None  # initialized to zeros in memory-warmup block below
@@ -969,6 +970,8 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    if TRAIN_WITH_MEMORY:
+        log0(f"train_with_memory:True mem_inject_scale:{MEM_INJECT_SCALE} mem_update_every:{MEM_UPDATE_EVERY}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1045,6 +1048,20 @@ def main() -> None:
                 train_mem = (_mem_alpha * train_mem + (1.0 - _mem_alpha) * new_signal).detach()
                 _norms = train_mem.norm(dim=-1, keepdim=True)
                 train_mem = torch.where(_norms > _mem_clamp, train_mem * _mem_clamp / (_norms + 1e-8), train_mem)
+            # When sparse updates are configured, also compile the non-update graph variant
+            # (return_final_hidden=False with a memory tensor) so both cached graphs are
+            # warm before the timed window starts — no cold recompile at the first
+            # non-update step.
+            if MEM_UPDATE_EVERY > 1:
+                zero_grad_all()
+                for micro_step in range(grad_accum_steps):
+                    x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        loss = compiled_model(
+                            x, y, memory=train_mem, inject_scale=MEM_INJECT_SCALE, return_final_hidden=False
+                        )
+                    (loss * grad_scale).backward()
+                zero_grad_all()
             # Restore clean model & optimiser state for proper timed training.
             base_model.load_state_dict(initial_model_state, strict=True)
             for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
@@ -1104,27 +1121,34 @@ def main() -> None:
         train_loss = torch.zeros((), device=device)
 
         if TRAIN_WITH_MEMORY:
-            # Memory-aware training: same micro_steps as baseline for identical data throughput.
-            # Always call compiled_model with return_final_hidden=True so torch.compile sees a
-            # single static graph (no branching = no recompilation). final_h from earlier
-            # micro-steps is simply discarded; only the last one is used for the EMA update.
+            # Memory injection is active every step; train_mem is updated only every
+            # MEM_UPDATE_EVERY steps.  On non-update steps the model still receives
+            # (and benefits from) the previous train_mem value — we just skip the
+            # final_h materialisation, using the faster return_final_hidden=False graph.
+            do_mem_update = (step % MEM_UPDATE_EVERY == 0)
             final_h: Tensor | None = None
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    loss, final_h = compiled_model(
-                        x, y, memory=train_mem, inject_scale=MEM_INJECT_SCALE, return_final_hidden=True
-                    )
+                    if do_mem_update:
+                        loss, final_h = compiled_model(
+                            x, y, memory=train_mem, inject_scale=MEM_INJECT_SCALE, return_final_hidden=True
+                        )
+                    else:
+                        loss = compiled_model(
+                            x, y, memory=train_mem, inject_scale=MEM_INJECT_SCALE, return_final_hidden=False
+                        )
                 train_loss += loss.detach()
                 (loss * grad_scale).backward()
             train_loss /= grad_accum_steps
-            # Update train_mem from the last micro-step's hidden state.
-            new_signal = final_h.float().mean(dim=1).detach()  # type: ignore[union-attr]  # (B, D)
-            train_mem = (_mem_alpha * train_mem + (1.0 - _mem_alpha) * new_signal).detach()  # type: ignore[operator]
-            _norms = train_mem.norm(dim=-1, keepdim=True)
-            train_mem = torch.where(_norms > _mem_clamp, train_mem * _mem_clamp / (_norms + 1e-8), train_mem)
+            if do_mem_update and final_h is not None:
+                # Update train_mem from the last micro-step's hidden state.
+                new_signal = final_h.float().mean(dim=1).detach()  # (B, D)
+                train_mem = (_mem_alpha * train_mem + (1.0 - _mem_alpha) * new_signal).detach()  # type: ignore[operator]
+                _norms = train_mem.norm(dim=-1, keepdim=True)
+                train_mem = torch.where(_norms > _mem_clamp, train_mem * _mem_clamp / (_norms + 1e-8), train_mem)
         else:
             for micro_step in range(grad_accum_steps):
                 if distributed:

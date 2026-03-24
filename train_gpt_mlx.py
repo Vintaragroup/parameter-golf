@@ -786,6 +786,7 @@ def eval_val(
     max_mem_norm: float = 10.0,             # LOCAL ONLY — per-row norm clamp for stream memory
     mem_injection: str = "pre_x0",          # LOCAL ONLY — injection point: "pre_x0" or "post_x0"
     inject_scale: float = 1.0,              # LOCAL ONLY — scale memory to this fraction of embedding norm
+    mem_summary: str = "mean_all_tokens",   # LOCAL ONLY — how to pool hidden states into memory signal
     model=None,                             # required when use_stream_memory=True
 ) -> tuple[float, float]:
     # Validation computes two metrics:
@@ -829,8 +830,15 @@ def eval_val(
             logits = model.softcap(flat @ model.tok_emb.weight.astype(flat.dtype).T)
             batch_loss = nn.losses.cross_entropy(logits.astype(mx.float32), y.reshape(-1), reduction="mean")
             mx.eval(batch_loss)
-            # EMA memory update: mean over token dim -> (B, D)
-            new_signal = hidden.mean(axis=1).astype(mx.float32)
+            # EMA memory update: pool hidden states -> (B, D) according to mem_summary
+            if mem_summary == "last_token":
+                new_signal = hidden[:, -1, :].astype(mx.float32)
+            elif mem_summary == "mean_last_quarter":
+                _T = hidden.shape[1]
+                _q = 3 * _T // 4
+                new_signal = hidden[:, _q:, :].mean(axis=1).astype(mx.float32)
+            else:  # "mean_all_tokens" (default)
+                new_signal = hidden.mean(axis=1).astype(mx.float32)
             mx.eval(new_signal)
             B, D = new_signal.shape
             if doc_memory is None or doc_memory.shape != (B, D):
@@ -1265,9 +1273,10 @@ def run_local_train_then_eval() -> None:
     _clamp = 15.0
     _mode  = "pre_x0"
 
-    _inject_scales = [0.02, 0.05, 0.10, 0.20]   # ablation grid — trained-model injection scale
+    _inject_scale  = 0.02                                              # fixed for summary-mode ablation
+    _summary_modes = ["mean_all_tokens", "last_token", "mean_last_quarter"]  # ablation grid
 
-    print(f"\n===== POST-TRAINING STREAM MEMORY EVAL (cap={_cap}, alpha={_alpha}, clamp={_clamp}) =====")
+    print(f"\n===== POST-TRAINING STREAM MEMORY EVAL (cap={_cap}, alpha={_alpha}, clamp={_clamp}, inject_scale={_inject_scale}) =====")
 
     print("\n===== BASELINE RUN =====")
     t0 = time.perf_counter()
@@ -1279,27 +1288,74 @@ def run_local_train_then_eval() -> None:
     )
     print(f"  val_loss={base_loss:.4f}  val_bpb={base_bpb:.4f}  time={1000*(time.perf_counter()-t0):.0f}ms")
 
-    print(f"\n===== INJECT SCALE ABLATION (scales={_inject_scales}) =====")
-    for _scale in _inject_scales:
-        print(f"\n----- inject_scale={_scale} -----")
-        t1 = time.perf_counter()
-        mem_loss, mem_bpb = eval_val(
-            args, compiled_loss, val_tokens,
-            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            max_eval_batches=_cap,
-            use_stream_memory=True,
-            mem_alpha=_alpha,
-            max_mem_norm=_clamp,
-            mem_injection=_mode,
-            inject_scale=_scale,
-            model=model,
-        )
-        print(f"  val_loss={mem_loss:.4f}  val_bpb={mem_bpb:.4f}  time={1000*(time.perf_counter()-t1):.0f}ms")
-        print(f"  baseline_bpb={base_bpb:.4f}  memory_bpb={mem_bpb:.4f}  delta_bpb={mem_bpb - base_bpb:+.4f}  (negative = memory helps)")
+    # --- summary mode ablation loop ---
+    import io, re as _re, sys as _sys
 
-    print("\n===== ABLATION SUMMARY =====")
-    print(f"  training_steps={LOCAL_TRAIN_ITERATIONS}  batch_tokens={LOCAL_TRAIN_BATCH_TOKENS}")
-    print(f"  alpha={_alpha}  clamp={_clamp}  injection={_mode}  baseline_bpb={base_bpb:.4f}")
+    def _run_summary(_summary: str) -> dict:
+        """Run one memory eval with a given summary mode, capture diagnostics, return result dict."""
+        _buf = io.StringIO()
+        _saved_stdout = _sys.stdout
+        _sys.stdout = _buf
+        t1 = time.perf_counter()
+        try:
+            mem_loss, mem_bpb = eval_val(
+                args, compiled_loss, val_tokens,
+                base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                max_eval_batches=_cap,
+                use_stream_memory=True,
+                mem_alpha=_alpha,
+                max_mem_norm=_clamp,
+                mem_injection=_mode,
+                inject_scale=_inject_scale,
+                mem_summary=_summary,
+                model=model,
+            )
+        finally:
+            _sys.stdout = _saved_stdout
+        _elapsed_ms = 1000 * (time.perf_counter() - t1)
+
+        # Re-emit captured output so per-batch [Memory] lines remain visible
+        _captured = _buf.getvalue()
+        print(_captured, end="")
+
+        # Parse eff_inject_ratio from [Memory] lines: "batch=N ... eff_inject_ratio=X"
+        _ratios: dict[int, float] = {}
+        for _m in _re.finditer(r"\[Memory\] batch=(\d+).*?eff_inject_ratio=([0-9.]+)", _captured):
+            _ratios[int(_m.group(1))] = float(_m.group(2))
+
+        return {
+            "summary":     _summary,
+            "memory_bpb":  mem_bpb,
+            "delta_bpb":   mem_bpb - base_bpb,
+            "ratio_b0":    _ratios.get(0),
+            "ratio_b50":   _ratios.get(50),
+            "time_ms":     _elapsed_ms,
+        }
+
+    print(f"\n===== SUMMARY MODE ABLATION (modes={_summary_modes}) =====")
+    _results = []
+    for _summary in _summary_modes:
+        print(f"\n----- summary={_summary} -----")
+        _r = _run_summary(_summary)
+        _results.append(_r)
+        print(f"  val_bpb={_r['memory_bpb']:.4f}  delta_bpb={_r['delta_bpb']:+.4f}  time={_r['time_ms']:.0f}ms")
+
+    # --- structured summary table ---
+    print("\n===== SUMMARY MODE RESULTS =====\n")
+    _hdr = f"{'summary_mode':<20} | {'memory_bpb':>10} | {'delta_bpb':>9} | {'ratio_b0':>8} | {'ratio_b50':>9} | {'time_ms':>8}"
+    print(_hdr)
+    print("-" * len(_hdr))
+    for _r in _results:
+        _rb0  = f"{_r['ratio_b0']:.4f}"  if _r['ratio_b0']  is not None else "    N/A"
+        _rb50 = f"{_r['ratio_b50']:.4f}" if _r['ratio_b50'] is not None else "    N/A"
+        print(
+            f"{_r['summary']:<20} | {_r['memory_bpb']:>10.4f} | {_r['delta_bpb']:>+9.4f} | "
+            f"{_rb0:>8} | {_rb50:>9} | {_r['time_ms']:>7.0f}ms"
+        )
+    print()
+    print(f"  baseline_bpb={base_bpb:.4f}  training_steps={LOCAL_TRAIN_ITERATIONS}  "
+          f"batch_tokens={LOCAL_TRAIN_BATCH_TOKENS}  alpha={_alpha}  clamp={_clamp}  "
+          f"inject_scale={_inject_scale}  injection={_mode}")
 
 
 def run_local_experiment() -> None:

@@ -229,6 +229,7 @@ def eval_val(
     is_boundary_token_lut: Tensor,
     max_eval_batches: int | None = None,  # LOCAL ONLY — set None for official eval
     use_stream_memory: bool = False,       # LOCAL ONLY — set False for official eval
+    inject_scale: float = 0.10,            # LOCAL ONLY — scale for later_residual injection
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
@@ -254,7 +255,8 @@ def eval_val(
     if use_stream_memory:
         print("[Stream Memory] enabled (local experiment)")
     doc_memory: Tensor | None = None
-    _mem_alpha = 0.9
+    _mem_alpha = 0.70   # best config from ablation (alpha sweep: 0.70 wins)
+    _mem_clamp = 15.0   # best config from ablation (clamp sweep: 15.0 wins)
     with torch.inference_mode():
         for eval_step, batch_seq_start in enumerate(range(seq_start, seq_end, local_batch_seqs)):
             if max_eval_batches is not None and eval_step >= max_eval_batches:
@@ -267,18 +269,22 @@ def eval_val(
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 if use_stream_memory:
-                    batch_loss, final_hidden = model(x, y, memory=doc_memory, return_final_hidden=True)
+                    batch_loss, final_hidden = model(
+                        x, y, memory=doc_memory, inject_scale=inject_scale, return_final_hidden=True
+                    )
                 else:
                     batch_loss = model(x, y)
                 batch_loss = batch_loss.detach()
             if use_stream_memory:
-                # Update memory: EMA of per-sequence mean over the token dimension.
-                new_signal = final_hidden.mean(dim=1)  # (B, D)
+                # EMA update: mean-pool over tokens, then clamp row norms.
+                new_signal = final_hidden.float().mean(dim=1)  # (B, D)
                 if doc_memory is None or doc_memory.shape != new_signal.shape:
                     doc_memory = torch.zeros_like(new_signal)
                 doc_memory = (_mem_alpha * doc_memory + (1.0 - _mem_alpha) * new_signal).detach()
+                norms = doc_memory.norm(dim=-1, keepdim=True)
+                doc_memory = torch.where(norms > _mem_clamp, doc_memory * _mem_clamp / (norms + 1e-8), doc_memory)
                 if eval_step % 50 == 0:
-                    print(f"[Memory] eval_step={eval_step} norm={doc_memory.norm().item():.4f}")
+                    print(f"[Memory] eval_step={eval_step} norm={doc_memory.norm().item():.4f} inject_scale={inject_scale}")
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -725,13 +731,11 @@ class GPT(nn.Module):
         target_ids: Tensor,
         *,
         memory: Tensor | None = None,
+        inject_scale: float = 0.0,
         return_final_hidden: bool = False,
     ):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
-        # Inject cross-chunk document memory (eval only; no-op when memory is None).
-        if memory is not None:
-            x = x + memory.unsqueeze(1).to(dtype=x.dtype)
         x0 = x
         skips: list[Tensor] = []
 
@@ -739,6 +743,14 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
+        # later_residual: inject cross-chunk memory at U-Net bottleneck.
+        # Scale memory so its per-row norm matches inject_scale * mean embedding norm.
+        # No-op when memory is None or inject_scale == 0.
+        if memory is not None and inject_scale > 0.0:
+            emb_norms = x.float().norm(dim=-1, keepdim=True)           # (B, T, 1)
+            mem_norms = memory.float().norm(dim=-1, keepdim=True)       # (B, 1)
+            scale = inject_scale * emb_norms.mean(dim=1) / (mem_norms + 1e-8)  # (B, 1)
+            x = x + (memory * scale).to(x.dtype).unsqueeze(1)          # (B, 1, D) broadcasts over T
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
@@ -774,6 +786,15 @@ def main() -> None:
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
     # -----------------------------
+
+    # Memory-aware training config — enabled via env var, default off.
+    # Best config from MLX ablation: inject_scale=0.10 (strongest learned effect),
+    # inject_scale=0.02 for a conservative first CUDA confirmation.
+    TRAIN_WITH_MEMORY: bool = os.environ.get("TRAIN_WITH_MEMORY", "0") == "1"
+    MEM_INJECT_SCALE: float = float(os.environ.get("MEM_INJECT_SCALE", "0.10"))
+    _mem_alpha: float = 0.70
+    _mem_clamp: float = 15.0
+    train_mem: Tensor | None = None
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
@@ -1044,15 +1065,34 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
-        for micro_step in range(grad_accum_steps):
-            if distributed:
-                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+
+        if TRAIN_WITH_MEMORY:
+            # Memory-aware training: single microbatch per step.
+            # Phase 1 — inference-only forward to build train_mem (no grad needed, use base_model).
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                _, final_h = base_model(x, y, memory=train_mem, inject_scale=MEM_INJECT_SCALE, return_final_hidden=True)
+            new_signal = final_h.float().mean(dim=1).detach()  # (B, D)
+            if train_mem is None or train_mem.shape != new_signal.shape:
+                train_mem = torch.zeros_like(new_signal)
+            train_mem = (_mem_alpha * train_mem + (1.0 - _mem_alpha) * new_signal).detach()
+            _norms = train_mem.norm(dim=-1, keepdim=True)
+            train_mem = torch.where(_norms > _mem_clamp, train_mem * _mem_clamp / (_norms + 1e-8), train_mem)
+            # Phase 2 — forward with updated train_mem, compute loss and grad.
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
-            train_loss += loss.detach()
-            (loss * grad_scale).backward()
-        train_loss /= grad_accum_steps
+                loss = model(x, y, memory=train_mem, inject_scale=MEM_INJECT_SCALE)
+            train_loss = loss.detach()
+            loss.backward()
+        else:
+            for micro_step in range(grad_accum_steps):
+                if distributed:
+                    model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    loss = model(x, y)
+                train_loss += loss.detach()
+                (loss * grad_scale).backward()
+            train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum

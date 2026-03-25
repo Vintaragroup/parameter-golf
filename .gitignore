@@ -9,3 +9,11 @@ data/docs_selected.jsonl
 .mypy_cache/
 .venv
 logs/
+AGENTS.md
+CLAUDE.md
+.giga/specifications.json
+.giga/rules/compression-metrics.mdc
+.giga/rules/data-pipeline-flow.mdc
+.giga/rules/learning-rate-control.mdc
+.giga/rules/model-training-algorithms.mdc
+.github/copilot-instructions.md

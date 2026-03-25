@@ -731,7 +731,9 @@ class GPT(nn.Module):
             # Treated as captured module state by torch.compile (like a weight),
             # so the compiled forward signature stays (input_ids, target_ids) — baseline-identical.
             self.register_buffer("mem_buffer", torch.zeros(1, mem_dim, dtype=torch.float32), persistent=False)
-            self._mem_aux_scale: float = 0.001  # overridden by main() via MEM_AUX_SCALE env var
+            # V2.1: learned gate scalar, init=0 → memory starts as no-op and earns usage via backprop.
+            self.mem_gate = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+            self._mem_aux_scale: float = 0.0005  # overridden by main() via MEM_AUX_SCALE env var
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -768,7 +770,10 @@ class GPT(nn.Module):
         # The compiled forward signature is (input_ids, target_ids) — identical to baseline,
         # so Triton fusion is fully preserved.
         if self.with_memory:
-            x = x + self.mem_proj_out(self.mem_buffer.to(x.dtype)).unsqueeze(1)  # (1, 1, D) → (B, T, D)
+            # V2.1: RMSNorm the memory state before projecting, then gate with learned scalar.
+            # Gate init=0 → injection is a true no-op at step 0; must earn signal via backprop.
+            mem_normed = F.rms_norm(self.mem_buffer.to(x.dtype), (self.mem_buffer.size(-1),))
+            x = x + self.mem_gate.to(x.dtype) * self.mem_proj_out(mem_normed).unsqueeze(1)  # (1, 1, D) → (B, T, D)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
@@ -809,7 +814,8 @@ class GPT(nn.Module):
                 x = self.blocks[i](x, x0)
                 skips.append(x)
             if self.with_memory:
-                x = x + self.mem_proj_out(self.mem_buffer.to(x.dtype)).unsqueeze(1)
+                mem_normed = F.rms_norm(self.mem_buffer.to(x.dtype), (self.mem_buffer.size(-1),))
+                x = x + self.mem_gate.to(x.dtype) * self.mem_proj_out(mem_normed).unsqueeze(1)
             for i in range(self.num_decoder_layers):
                 if skips:
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
@@ -838,8 +844,8 @@ def main() -> None:
     # Signal extracted via a separate no_grad forward OUTSIDE the compiled graph.
     TRAIN_WITH_MEMORY: bool = os.environ.get("TRAIN_WITH_MEMORY", "0") == "1"
     MEM_UPDATE_EVERY: int = int(os.environ.get("MEM_UPDATE_EVERY", "1"))  # extract signal every N steps
-    MEM_AUX_SCALE: float = float(os.environ.get("MEM_AUX_SCALE", "0.001"))  # aux reconstruction loss weight
-    _mem_alpha: float = 0.70
+    MEM_AUX_SCALE: float = float(os.environ.get("MEM_AUX_SCALE", "0.0005"))  # aux reconstruction loss weight
+    _mem_alpha: float = float(os.environ.get("MEM_ALPHA", "0.70"))  # EMA decay for memory state
     train_mem: Tensor | None = None  # initialized to zeros before warmup
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -969,8 +975,8 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     if base_model.with_memory:
-        # V2 memory projection weights trained with Adam at scalar_lr.
-        scalar_params.extend([base_model.mem_proj_in.weight, base_model.mem_proj_out.weight])
+        # V2 memory projection weights + gate trained with Adam at scalar_lr.
+        scalar_params.extend([base_model.mem_proj_in.weight, base_model.mem_proj_out.weight, base_model.mem_gate])
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1020,7 +1026,7 @@ def main() -> None:
     log0(f"seed:{args.seed}")
     if TRAIN_WITH_MEMORY:
         base_model._mem_aux_scale = MEM_AUX_SCALE
-        log0(f"train_with_memory:v2 mem_dim:{base_model.mem_proj_in.out_features} mem_alpha:{_mem_alpha} mem_update_every:{MEM_UPDATE_EVERY} mem_aux_scale:{MEM_AUX_SCALE}")
+        log0(f"train_with_memory:v2.1 mem_dim:{base_model.mem_proj_in.out_features} mem_alpha:{_mem_alpha} mem_update_every:{MEM_UPDATE_EVERY} mem_aux_scale:{MEM_AUX_SCALE}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1199,6 +1205,7 @@ def main() -> None:
             if TRAIN_WITH_MEMORY:
                 grad_status = "non-null" if _mem_proj_in_grad_non_null else "null"
                 mem_extra = (f" mem_buf_norm:{base_model.mem_buffer.norm().item():.4f}"
+                             f" mem_gate:{base_model.mem_gate.item():.4f}"
                              f" proj_in_grad:{grad_status}")
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "

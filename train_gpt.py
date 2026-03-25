@@ -731,6 +731,7 @@ class GPT(nn.Module):
             # Treated as captured module state by torch.compile (like a weight),
             # so the compiled forward signature stays (input_ids, target_ids) — baseline-identical.
             self.register_buffer("mem_buffer", torch.zeros(1, mem_dim, dtype=torch.float32), persistent=False)
+            self._mem_aux_scale: float = 0.001  # overridden by main() via MEM_AUX_SCALE env var
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -784,6 +785,15 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        if self.with_memory:
+            # Aux reconstruction loss: trains mem_proj_in directly via tied autoencoder.
+            # Uses mem_proj_in.weight for both encode (B,D->B,mem_dim) and decode
+            # (B,mem_dim @ weight -> B,D), so mem_proj_in always gets gradients even
+            # when mem_proj_out is zero-init. last_h is detached — no transformer grads.
+            last_h = final_h[:, -1, :].detach().float()  # (B, D)
+            sig = self.mem_proj_in(last_h)               # (B, mem_dim)
+            recon = sig @ self.mem_proj_in.weight         # (B, D) — tied decode
+            loss = loss + self._mem_aux_scale * F.mse_loss(recon, last_h)
         return loss
 
     def extract_mem_signal(self, input_ids: Tensor) -> Tensor:
@@ -828,6 +838,7 @@ def main() -> None:
     # Signal extracted via a separate no_grad forward OUTSIDE the compiled graph.
     TRAIN_WITH_MEMORY: bool = os.environ.get("TRAIN_WITH_MEMORY", "0") == "1"
     MEM_UPDATE_EVERY: int = int(os.environ.get("MEM_UPDATE_EVERY", "1"))  # extract signal every N steps
+    MEM_AUX_SCALE: float = float(os.environ.get("MEM_AUX_SCALE", "0.001"))  # aux reconstruction loss weight
     _mem_alpha: float = 0.70
     train_mem: Tensor | None = None  # initialized to zeros before warmup
 
@@ -1008,7 +1019,8 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
     if TRAIN_WITH_MEMORY:
-        log0(f"train_with_memory:v2 mem_dim:{base_model.mem_proj_in.out_features} mem_alpha:{_mem_alpha} mem_update_every:{MEM_UPDATE_EVERY}")
+        base_model._mem_aux_scale = MEM_AUX_SCALE
+        log0(f"train_with_memory:v2 mem_dim:{base_model.mem_proj_in.out_features} mem_alpha:{_mem_alpha} mem_update_every:{MEM_UPDATE_EVERY} mem_aux_scale:{MEM_AUX_SCALE}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1170,6 +1182,8 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        # Capture grad status BEFORE optimizer.step() zeroes grads.
+        _mem_proj_in_grad_non_null = TRAIN_WITH_MEMORY and base_model.mem_proj_in.weight.grad is not None
         for opt in optimizers:
             opt.step()
         zero_grad_all()
@@ -1181,9 +1195,15 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            mem_extra = ""
+            if TRAIN_WITH_MEMORY:
+                grad_status = "non-null" if _mem_proj_in_grad_non_null else "null"
+                mem_extra = (f" mem_buf_norm:{base_model.mem_buffer.norm().item():.4f}"
+                             f" proj_in_grad:{grad_status}")
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                + mem_extra
             )
 
         # Needed to sync whether we've reached the wallclock cap.

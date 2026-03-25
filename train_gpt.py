@@ -731,11 +731,9 @@ class GPT(nn.Module):
             # Treated as captured module state by torch.compile (like a weight),
             # so the compiled forward signature stays (input_ids, target_ids) — baseline-identical.
             self.register_buffer("mem_buffer", torch.zeros(1, mem_dim, dtype=torch.float32), persistent=False)
-            # V2.2: gate init=0.01 (not 0) to break the zero-gradient deadlock.
-            # With gate=0 AND _zero_init on mem_proj_out, both have zero gradients forever.
-            # gate=0.01 gives mem_proj_out a non-zero gradient path: grad(W)=gate*dL/dx*mem_normed.
-            # Injection is still ~zero at step 0 because mem_proj_out starts zeroed.
-            self.mem_gate = nn.Parameter(torch.full((1,), 0.01, dtype=torch.float32))
+            # V2.4: no learned gate — fixed injection scale set from outside (plain Python float).
+            # Eliminates the scalar-gate collapse pattern seen in V2.2/V2.3.
+            self._mem_inject_scale: float = 0.03  # overridden by main() via MEM_INJECT_SCALE env var
             self._mem_aux_scale: float = 0.0005  # overridden by main() via MEM_AUX_SCALE env var
         self._init_weights()
 
@@ -773,13 +771,12 @@ class GPT(nn.Module):
         # The compiled forward signature is (input_ids, target_ids) — identical to baseline,
         # so Triton fusion is fully preserved.
         if self.with_memory:
-            # V2.3: RMSNorm → 0.7 magnitude clamp → project → tanh-gated injection.
-            # tanh bounds gate to (-1,1); 0.7 scale prevents memory overpowering residual.
+            # V2.4: RMSNorm → 0.7 magnitude clamp → project → fixed-scale injection.
+            # No learned gate: _mem_inject_scale is a plain Python float (no torch.compile issues).
             mem_normed = F.rms_norm(self.mem_buffer.to(x.dtype), (self.mem_buffer.size(-1),))
             mem_scaled = 0.7 * mem_normed
             mem_out = self.mem_proj_out(mem_scaled)
-            gate = torch.tanh(self.mem_gate.to(x.dtype))
-            x = x + gate * mem_out.unsqueeze(1)  # (1, 1, D) → (B, T, D)
+            x = x + self._mem_inject_scale * mem_out.unsqueeze(1)  # (1, 1, D) → (B, T, D)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
@@ -823,8 +820,7 @@ class GPT(nn.Module):
                 mem_normed = F.rms_norm(self.mem_buffer.to(x.dtype), (self.mem_buffer.size(-1),))
                 mem_scaled = 0.7 * mem_normed
                 mem_out = self.mem_proj_out(mem_scaled)
-                gate = torch.tanh(self.mem_gate.to(x.dtype))
-                x = x + gate * mem_out.unsqueeze(1)
+                x = x + self._mem_inject_scale * mem_out.unsqueeze(1)
             for i in range(self.num_decoder_layers):
                 if skips:
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
@@ -854,6 +850,7 @@ def main() -> None:
     TRAIN_WITH_MEMORY: bool = os.environ.get("TRAIN_WITH_MEMORY", "0") == "1"
     MEM_UPDATE_EVERY: int = int(os.environ.get("MEM_UPDATE_EVERY", "1"))  # extract signal every N steps
     MEM_AUX_SCALE: float = float(os.environ.get("MEM_AUX_SCALE", "0.0005"))  # aux reconstruction loss weight
+    MEM_INJECT_SCALE: float = float(os.environ.get("MEM_INJECT_SCALE", "0.03"))  # fixed memory injection scale (V2.4)
     _mem_alpha: float = float(os.environ.get("MEM_ALPHA", "0.70"))  # EMA decay for memory state
     train_mem: Tensor | None = None  # initialized to zeros before warmup
 
@@ -984,8 +981,8 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     if base_model.with_memory:
-        # V2 memory projection weights + gate trained with Adam at scalar_lr.
-        scalar_params.extend([base_model.mem_proj_in.weight, base_model.mem_proj_out.weight, base_model.mem_gate])
+        # V2.4: no learned gate — only the two projection matrices in scalar Adam.
+        scalar_params.extend([base_model.mem_proj_in.weight, base_model.mem_proj_out.weight])
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1035,7 +1032,8 @@ def main() -> None:
     log0(f"seed:{args.seed}")
     if TRAIN_WITH_MEMORY:
         base_model._mem_aux_scale = MEM_AUX_SCALE
-        log0(f"train_with_memory:v2.3 mem_dim:{base_model.mem_proj_in.out_features} mem_alpha:{_mem_alpha} mem_update_every:{MEM_UPDATE_EVERY} mem_aux_scale:{MEM_AUX_SCALE}")
+        base_model._mem_inject_scale = MEM_INJECT_SCALE
+        log0(f"train_with_memory:v2.4 mem_dim:{base_model.mem_proj_in.out_features} mem_alpha:{_mem_alpha} mem_update_every:{MEM_UPDATE_EVERY} mem_aux_scale:{MEM_AUX_SCALE} mem_inject_scale:{MEM_INJECT_SCALE}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1217,9 +1215,10 @@ def main() -> None:
                     _mem_n = F.rms_norm(base_model.mem_buffer, (base_model.mem_buffer.size(-1),))
                     _mem_out = base_model.mem_proj_out(0.7 * _mem_n.to(base_model.mem_proj_out.weight.dtype))
                     _inject_norm = _mem_out.norm().item()
+                    _applied_norm = base_model._mem_inject_scale * _inject_norm
                 mem_extra = (f" mem_buf_norm:{base_model.mem_buffer.norm().item():.4f}"
-                             f" mem_gate:{base_model.mem_gate.item():.4f}"
                              f" mem_inject_norm:{_inject_norm:.4f}"
+                             f" mem_applied_norm:{_applied_norm:.4f}"
                              f" proj_in_grad:{grad_status}")
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "

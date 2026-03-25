@@ -731,8 +731,11 @@ class GPT(nn.Module):
             # Treated as captured module state by torch.compile (like a weight),
             # so the compiled forward signature stays (input_ids, target_ids) — baseline-identical.
             self.register_buffer("mem_buffer", torch.zeros(1, mem_dim, dtype=torch.float32), persistent=False)
-            # V2.1: learned gate scalar, init=0 → memory starts as no-op and earns usage via backprop.
-            self.mem_gate = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+            # V2.2: gate init=0.01 (not 0) to break the zero-gradient deadlock.
+            # With gate=0 AND _zero_init on mem_proj_out, both have zero gradients forever.
+            # gate=0.01 gives mem_proj_out a non-zero gradient path: grad(W)=gate*dL/dx*mem_normed.
+            # Injection is still ~zero at step 0 because mem_proj_out starts zeroed.
+            self.mem_gate = nn.Parameter(torch.full((1,), 0.01, dtype=torch.float32))
             self._mem_aux_scale: float = 0.0005  # overridden by main() via MEM_AUX_SCALE env var
         self._init_weights()
 
@@ -770,8 +773,9 @@ class GPT(nn.Module):
         # The compiled forward signature is (input_ids, target_ids) — identical to baseline,
         # so Triton fusion is fully preserved.
         if self.with_memory:
-            # V2.1: RMSNorm the memory state before projecting, then gate with learned scalar.
-            # Gate init=0 → injection is a true no-op at step 0; must earn signal via backprop.
+            # V2.2: RMSNorm the memory state before projecting, then gate with learned scalar.
+            # Gate init=0.01, proj_out init=zeros → injection ~zero at step 0.
+            # Non-zero gate gives proj_out non-zero gradient from step 1 (breaks zero deadlock).
             mem_normed = F.rms_norm(self.mem_buffer.to(x.dtype), (self.mem_buffer.size(-1),))
             x = x + self.mem_gate.to(x.dtype) * self.mem_proj_out(mem_normed).unsqueeze(1)  # (1, 1, D) → (B, T, D)
         for i in range(self.num_decoder_layers):
@@ -1026,7 +1030,7 @@ def main() -> None:
     log0(f"seed:{args.seed}")
     if TRAIN_WITH_MEMORY:
         base_model._mem_aux_scale = MEM_AUX_SCALE
-        log0(f"train_with_memory:v2.1 mem_dim:{base_model.mem_proj_in.out_features} mem_alpha:{_mem_alpha} mem_update_every:{MEM_UPDATE_EVERY} mem_aux_scale:{MEM_AUX_SCALE}")
+        log0(f"train_with_memory:v2.2 mem_dim:{base_model.mem_proj_in.out_features} mem_alpha:{_mem_alpha} mem_update_every:{MEM_UPDATE_EVERY} mem_aux_scale:{MEM_AUX_SCALE}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP

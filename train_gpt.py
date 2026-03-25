@@ -773,11 +773,13 @@ class GPT(nn.Module):
         # The compiled forward signature is (input_ids, target_ids) — identical to baseline,
         # so Triton fusion is fully preserved.
         if self.with_memory:
-            # V2.2: RMSNorm the memory state before projecting, then gate with learned scalar.
-            # Gate init=0.01, proj_out init=zeros → injection ~zero at step 0.
-            # Non-zero gate gives proj_out non-zero gradient from step 1 (breaks zero deadlock).
+            # V2.3: RMSNorm → 0.7 magnitude clamp → project → tanh-gated injection.
+            # tanh bounds gate to (-1,1); 0.7 scale prevents memory overpowering residual.
             mem_normed = F.rms_norm(self.mem_buffer.to(x.dtype), (self.mem_buffer.size(-1),))
-            x = x + self.mem_gate.to(x.dtype) * self.mem_proj_out(mem_normed).unsqueeze(1)  # (1, 1, D) → (B, T, D)
+            mem_scaled = 0.7 * mem_normed
+            mem_out = self.mem_proj_out(mem_scaled)
+            gate = torch.tanh(self.mem_gate.to(x.dtype))
+            x = x + gate * mem_out.unsqueeze(1)  # (1, 1, D) → (B, T, D)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
@@ -819,7 +821,10 @@ class GPT(nn.Module):
                 skips.append(x)
             if self.with_memory:
                 mem_normed = F.rms_norm(self.mem_buffer.to(x.dtype), (self.mem_buffer.size(-1),))
-                x = x + self.mem_gate.to(x.dtype) * self.mem_proj_out(mem_normed).unsqueeze(1)
+                mem_scaled = 0.7 * mem_normed
+                mem_out = self.mem_proj_out(mem_scaled)
+                gate = torch.tanh(self.mem_gate.to(x.dtype))
+                x = x + gate * mem_out.unsqueeze(1)
             for i in range(self.num_decoder_layers):
                 if skips:
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
@@ -1030,7 +1035,7 @@ def main() -> None:
     log0(f"seed:{args.seed}")
     if TRAIN_WITH_MEMORY:
         base_model._mem_aux_scale = MEM_AUX_SCALE
-        log0(f"train_with_memory:v2.2 mem_dim:{base_model.mem_proj_in.out_features} mem_alpha:{_mem_alpha} mem_update_every:{MEM_UPDATE_EVERY} mem_aux_scale:{MEM_AUX_SCALE}")
+        log0(f"train_with_memory:v2.3 mem_dim:{base_model.mem_proj_in.out_features} mem_alpha:{_mem_alpha} mem_update_every:{MEM_UPDATE_EVERY} mem_aux_scale:{MEM_AUX_SCALE}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1208,8 +1213,13 @@ def main() -> None:
             mem_extra = ""
             if TRAIN_WITH_MEMORY:
                 grad_status = "non-null" if _mem_proj_in_grad_non_null else "null"
+                with torch.no_grad():
+                    _mem_n = F.rms_norm(base_model.mem_buffer, (base_model.mem_buffer.size(-1),))
+                    _mem_out = base_model.mem_proj_out(0.7 * _mem_n.to(base_model.mem_proj_out.weight.dtype))
+                    _inject_norm = _mem_out.norm().item()
                 mem_extra = (f" mem_buf_norm:{base_model.mem_buffer.norm().item():.4f}"
                              f" mem_gate:{base_model.mem_gate.item():.4f}"
+                             f" mem_inject_norm:{_inject_norm:.4f}"
                              f" proj_in_grad:{grad_status}")
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
